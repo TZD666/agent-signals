@@ -1,0 +1,10 @@
+# Agent Signals — runtime dependencies
+#
+# There are none. server.py runs on the Python 3.9+ standard library alone
+# (http.server, sqlite3, subprocess, threading, pathlib, json, hashlib).
+#
+# The file exists so `pip install -r requirements.txt` is a no-op success
+# instead of a missing-file error in CI or container builds.
+#
+# Non-Python requirements are listed in README.md under "Requirements":
+# macOS (osascript, BSD ps) plus Claude Code and/or Codex Desktop.

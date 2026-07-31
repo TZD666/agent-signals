@@ -1,0 +1,48 @@
+{
+  "name": "agent-signals",
+  "version": "1.0.0",
+  "description": "Agent 干啥呢 — a local breathing-light panel showing what your Claude Code and Codex sessions are doing right now",
+  "keywords": [
+    "claude-code",
+    "codex",
+    "agent",
+    "status",
+    "monitor",
+    "dashboard",
+    "macos",
+    "ipad"
+  ],
+  "homepage": "https://github.com/TZD666/agent-signals#readme",
+  "bugs": {
+    "url": "https://github.com/TZD666/agent-signals/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TZD666/agent-signals.git"
+  },
+  "license": "MIT",
+  "author": "TZD666",
+  "type": "commonjs",
+  "bin": {
+    "agent-signals": "bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "static/",
+    "server.py",
+    "requirements.txt",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "darwin"
+  ],
+  "scripts": {
+    "start": "node bin/cli.js",
+    "test": "python3 -m unittest discover tests -v"
+  }
+}

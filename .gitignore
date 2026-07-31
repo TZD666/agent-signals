@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+
+# Runtime state: contains local session ids, never commit
+.agent-signals-state.json
+.agent-signals-state.json.tmp
+
+# Agent tooling scratch state
+.omc/
+.claude/
+
+# npm
+node_modules/
+*.tgz
+
+# macOS
+.DS_Store
