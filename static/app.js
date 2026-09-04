@@ -18,6 +18,7 @@ const SOURCE_STATE_LABELS = {
 };
 
 const ALERT_STATUSES = new Set(["needs_input", "stalled"]);
+const LOAD_HIGH_PCT = 80;
 const MINUTE_MS = 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const POLL_WAIT_S = 8;
@@ -34,7 +35,10 @@ const STORAGE_KEYS = {
   dismissedCodex: "agent-signals.dismissed-codex",
   lockedCodex: "agent-signals.locked-codex",
   theme: "agent-signals.theme",
+  historyOpen: "agent-signals.history-open",
 };
+
+const HISTORY_REFRESH_MS = 30000;
 
 let snapshotSignature = "";
 let connected = false;
@@ -46,6 +50,8 @@ let latestData = { claude: [], codex: [] };
 let audioContext = null;
 let audioUnlocked = false;
 let pendingFlash = new Set();
+let historyTimer = null;
+let expandedHistoryKey = "";
 const previousStatus = new Map();
 
 function readStoredObject(key) {
@@ -126,6 +132,61 @@ function durationNote(agent) {
   if (agent.status !== "thinking") return "";
   const busy = Math.floor((Date.now() - Number(agent.updatedAt || 0)) / MINUTE_MS);
   return busy >= 1 ? `已持续 ${busy} 分钟` : "";
+}
+
+function formatTokensK(value) {
+  return `${Math.round(Number(value) / 1000)}k`;
+}
+
+function formatStepGap(ms) {
+  const seconds = Math.round(Number(ms) / 1000);
+  return seconds < 60 ? `~${seconds}秒/步` : `~${Math.round(seconds / 60)}分/步`;
+}
+
+function loadSig(load) {
+  return [load.contextPct, load.contextTokens, load.contextWindow, load.stepGapMs].join("|");
+}
+
+function loadText(load) {
+  const parts = [];
+  if (Number.isFinite(load.contextPct) && load.contextWindow) {
+    parts.push(
+      `${load.contextPct}% · ${formatTokensK(load.contextTokens)}/${formatTokensK(load.contextWindow)}`,
+    );
+  } else if (Number.isFinite(load.contextTokens)) {
+    parts.push(formatTokensK(load.contextTokens));
+  } else {
+    parts.push("—");
+  }
+  if (Number.isFinite(load.stepGapMs)) parts.push(formatStepGap(load.stepGapMs));
+  return parts.join(" · ");
+}
+
+function loadMarkup(agent) {
+  const load = agent.load;
+  if (!load || typeof load !== "object") return "";
+  const known = Number.isFinite(load.contextPct);
+  const pct = known ? Math.min(100, Math.max(0, Number(load.contextPct))) : 0;
+  const high = known && pct >= LOAD_HIGH_PCT;
+  return `
+    <span class="agent-load${high ? " is-high" : ""}" data-load-sig="${escapeHtml(loadSig(load))}">
+      <span class="load-bar${known ? "" : " is-unknown"}">${known ? `<i style="width:${pct}%"></i>` : ""}</span>
+      <span class="load-text">${escapeHtml(loadText(load))}</span>
+    </span>`;
+}
+
+function patchLoads(visible) {
+  for (const platform of ["claude", "codex"]) {
+    for (const agent of visible[platform]) {
+      if (!agent.load || typeof agent.load !== "object") continue;
+      const card = document.querySelector(
+        `.agent-card[data-platform="${CSS.escape(platform)}"][data-agent-id="${CSS.escape(agent.id)}"]`,
+      );
+      const element = card?.querySelector(".agent-load");
+      if (!element || element.dataset.loadSig === loadSig(agent.load)) continue;
+      element.outerHTML = loadMarkup(agent);
+    }
+  }
 }
 
 function satelliteMarkup(satellites) {
@@ -244,6 +305,7 @@ function cardMarkup(agent) {
           <span class="agent-name" title="${escapeHtml(agent.name)}">${escapeHtml(agent.name)}</span>
           <span class="agent-state">${escapeHtml(status)}</span>
           ${note ? `<span class="agent-note">${escapeHtml(note)}</span>` : ""}
+          ${loadMarkup(agent)}
           <span class="agent-meta">
             <span>${escapeHtml(agent.cwdLabel)}</span>
             <span>·</span>
@@ -431,13 +493,19 @@ function render(data) {
     codex: visibleAgents("codex", data.codex || []),
   };
 
+  // Load values churn during every turn; keep them out of the rebuild
+  // signature and patch them in place so orbit animations keep their phase.
+  const stripLoad = (agents) => agents.map(({ load, ...rest }) => rest);
   const signature = JSON.stringify({
-    visible,
+    visible: { claude: stripLoad(visible.claude), codex: stripLoad(visible.codex) },
     sources,
     notifications: data.notifications,
     audioUnlocked,
   });
-  if (signature === snapshotSignature) return;
+  if (signature === snapshotSignature) {
+    patchLoads(visible);
+    return;
+  }
   snapshotSignature = signature;
 
   document.querySelector("#lastUpdated").textContent =
@@ -597,9 +665,265 @@ function dismissAgent(id) {
   showToast("已关闭这个空闲任务的显示");
 }
 
+// ---- 费用与历史面板（数据来自 /api/history，独立于呼吸灯的 304 契约） ----
+
+function formatMicroUsd(value) {
+  if (!Number.isFinite(value)) return "—";
+  if (value <= 0) return "$0.00";
+  if (value < 10000) return "<$0.01";
+  return `$${(value / 1e6).toFixed(2)}`;
+}
+
+function formatTokensAny(value) {
+  if (!Number.isFinite(value)) return "—";
+  return value < 1000 ? String(value) : formatTokensK(value);
+}
+
+function formatClock(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return "—";
+  return new Date(ms).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+function formatSpan(startMs, endMs) {
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    return "—";
+  }
+  const minutes = Math.round((endMs - startMs) / MINUTE_MS);
+  if (minutes < 1) return "<1 分钟";
+  if (minutes < 60) return `${minutes} 分钟`;
+  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+}
+
+function tokensTitle(tokens) {
+  if (!tokens) return "";
+  const parts = [];
+  const push = (label, value) => {
+    if (Number.isFinite(value)) parts.push(`${label} ${formatTokensAny(value)}`);
+  };
+  push("输入", tokens.input);
+  push("输出", tokens.output);
+  push("缓存读", tokens.cacheRead);
+  push("缓存写5m", tokens.cacheWrite5m);
+  push("缓存写1h", tokens.cacheWrite1h);
+  push("缓存命中", tokens.cachedInput);
+  push("思考", tokens.reasoningOutput);
+  return parts.join(" · ");
+}
+
+function costMarkup(session) {
+  const estimate = session.costLabel === "估算";
+  return `<span class="cost-badge${estimate ? " is-estimate" : ""}" title="${escapeHtml(session.costLabel || "")}">${escapeHtml(formatMicroUsd(session.costMicroUsd))}</span>`;
+}
+
+function historyRowMarkup(session) {
+  const live = session.live === true;
+  const statusLabel = live
+    ? STATUS_LABELS[session.status] || "运行中"
+    : "已结束";
+  const model = session.model
+    ? `${session.model}${session.effort ? ` · ${session.effort}` : ""}${session.mixedModels ? "（混用）" : ""}`
+    : "模型未知";
+  const context = Number.isFinite(session.contextPeakPct)
+    ? `峰值 ${session.contextPeakPct}%`
+    : Number.isFinite(session.contextPeakTokens)
+      ? `峰值 ${formatTokensAny(session.contextPeakTokens)}`
+      : "—";
+  const endMs = live
+    ? Date.now()
+    : Number(session.endedAtMs || session.lastActiveAtMs);
+  const subagents = session.subagents || {};
+  const subLine = subagents.count
+    ? `<span class="history-sub">子代理 ×${subagents.count}${
+        Number.isFinite(subagents.totalTokens)
+          ? ` · ${formatTokensAny(subagents.totalTokens)}`
+          : ""
+      }${
+        Number.isFinite(subagents.costMicroUsd)
+          ? ` · ${formatMicroUsd(subagents.costMicroUsd)}`
+          : ""
+      }</span>`
+    : "";
+  const name = session.name || session.cwdLabel || String(session.id).slice(0, 8);
+  return `
+    <button
+      class="history-row${live ? " is-live" : ""}"
+      type="button"
+      data-action="history-detail"
+      data-session-key="${escapeHtml(session.sessionKey)}"
+      aria-expanded="${expandedHistoryKey === session.sessionKey}"
+      title="点击展开轮次时间线"
+    >
+      <span class="history-main">
+        <span class="history-dot status-${escapeHtml(session.status || "idle")}"></span>
+        <span class="history-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+        <span class="history-tag">${session.platform === "claude" ? "Claude" : "Codex"}</span>
+        <span class="history-tag">${escapeHtml(statusLabel)}</span>
+        ${costMarkup(session)}
+      </span>
+      <span class="history-info">
+        <span>${escapeHtml(formatClock(session.startedAtMs))} 启动</span>
+        <span>${escapeHtml(formatSpan(session.startedAtMs, endMs))}</span>
+        <span>${Number.isFinite(session.turnCount) ? `${session.turnCount} 轮` : "—"}</span>
+        <span title="${escapeHtml(tokensTitle(session.tokens))}">${escapeHtml(formatTokensAny(session.tokens?.total))} tok</span>
+        <span>${escapeHtml(context)}</span>
+        <span class="history-model">${escapeHtml(model)}</span>
+      </span>
+      ${subLine}
+    </button>
+    <div class="history-turns" data-turns-for="${escapeHtml(session.sessionKey)}" hidden></div>`;
+}
+
+function turnsMarkup(detail) {
+  const turns = detail.turns || [];
+  if (!turns.length) {
+    return `<p class="history-empty">还没有记录到轮次</p>`;
+  }
+  const rows = turns
+    .map((turn) => {
+      const tokens = turn.tokens || {};
+      const io = [
+        Number.isFinite(tokens.input) ? `进 ${formatTokensAny(tokens.input)}` : "",
+        Number.isFinite(tokens.output) ? `出 ${formatTokensAny(tokens.output)}` : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      return `
+        <div class="turn-row">
+          <span>${escapeHtml(formatClock(turn.startedAtMs))}</span>
+          <span>${escapeHtml(formatSpan(turn.startedAtMs, turn.endedAtMs))}</span>
+          <span title="${escapeHtml(tokensTitle(tokens))}">${escapeHtml(io || "—")}</span>
+          <span>${Number.isFinite(turn.contextTokens) ? `${formatTokensAny(turn.contextTokens)} ctx` : "—"}</span>
+          <span>${escapeHtml(formatMicroUsd(turn.costMicroUsd))}</span>
+        </div>`;
+    })
+    .join("");
+  return `<div class="turn-table">${rows}</div>`;
+}
+
+function renderHistory(data) {
+  const liveBox = document.querySelector("#historyLive");
+  const listBox = document.querySelector("#historyList");
+  if (!data || data.state === "initializing") {
+    liveBox.innerHTML = "";
+    listBox.innerHTML = `<p class="history-empty">正在建立历史库…${escapeHtml(data?.detail || "")}</p>`;
+    return;
+  }
+  const notes = [];
+  if (data.pricing?.claude === "fallback") {
+    notes.push("Claude 价格镜像不可用，使用内置兜底价目表");
+  }
+  if (data.detail) notes.push(data.detail);
+  const noteMarkup = notes.length
+    ? `<p class="history-empty">${escapeHtml(notes.join(" · "))}</p>`
+    : "";
+
+  const sessions = data.sessions || [];
+  const liveSessions = sessions.filter((session) => session.live);
+  const pastSessions = sessions.filter((session) => !session.live);
+  liveBox.innerHTML = liveSessions.length
+    ? `<h3>正在运行</h3>${liveSessions.map(historyRowMarkup).join("")}`
+    : "";
+  listBox.innerHTML =
+    noteMarkup +
+    (pastSessions.length
+      ? `<h3>近 7 天</h3>${pastSessions.map(historyRowMarkup).join("")}`
+      : liveSessions.length
+        ? ""
+        : `<p class="history-empty">近 7 天没有会话记录</p>`);
+
+  if (expandedHistoryKey) {
+    const key = expandedHistoryKey;
+    expandedHistoryKey = "";
+    toggleHistoryDetail(key);
+  }
+}
+
+async function fetchHistory() {
+  const panel = document.querySelector("#historyPanel");
+  if (panel.hidden) return;
+  try {
+    const response = await fetch("/api/history?days=7&limit=50", {
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error("历史接口不可用");
+    renderHistory(await response.json());
+  } catch {
+    document.querySelector("#historyList").innerHTML =
+      `<p class="history-empty">历史数据暂不可用（面板其余功能不受影响）</p>`;
+  }
+}
+
+async function toggleHistoryDetail(key) {
+  const container = document.querySelector(
+    `.history-turns[data-turns-for="${CSS.escape(key)}"]`,
+  );
+  const row = document.querySelector(
+    `.history-row[data-session-key="${CSS.escape(key)}"]`,
+  );
+  if (!container) return;
+  if (expandedHistoryKey === key && !container.hidden) {
+    container.hidden = true;
+    expandedHistoryKey = "";
+    row?.setAttribute("aria-expanded", "false");
+    return;
+  }
+  document.querySelectorAll(".history-turns").forEach((element) => {
+    element.hidden = true;
+  });
+  document.querySelectorAll(".history-row").forEach((element) => {
+    element.setAttribute("aria-expanded", "false");
+  });
+  expandedHistoryKey = key;
+  container.hidden = false;
+  row?.setAttribute("aria-expanded", "true");
+  container.innerHTML = `<p class="history-empty">载入轮次时间线…</p>`;
+  try {
+    const response = await fetch(
+      `/api/history/session?key=${encodeURIComponent(key)}&turns=100`,
+      { cache: "no-store" },
+    );
+    const detail = await response.json();
+    if (!response.ok) throw new Error(detail.error || "轮次数据暂不可用");
+    container.innerHTML = turnsMarkup(detail);
+  } catch (error) {
+    container.innerHTML = `<p class="history-empty">${escapeHtml(error.message || "轮次数据暂不可用")}</p>`;
+  }
+}
+
+function toggleHistory(open, persist = false) {
+  const panel = document.querySelector("#historyPanel");
+  const toggle = document.querySelector("#historyToggle");
+  panel.hidden = !open;
+  toggle.setAttribute("aria-expanded", String(open));
+  toggle.classList.toggle("is-active", open);
+  clearInterval(historyTimer);
+  historyTimer = null;
+  if (open) {
+    fetchHistory();
+    historyTimer = setInterval(fetchHistory, HISTORY_REFRESH_MS);
+  }
+  if (persist) {
+    try {
+      localStorage.setItem(STORAGE_KEYS.historyOpen, open ? "1" : "0");
+    } catch {
+      // 折叠状态记不住也不影响使用。
+    }
+  }
+}
+
 document.addEventListener("click", (event) => {
   unlockAudio();
   const control = event.target.closest("[data-action]");
+  if (control?.dataset.action === "history-detail") {
+    toggleHistoryDetail(control.dataset.sessionKey);
+    return;
+  }
   if (control?.dataset.action === "lock") {
     toggleLock(control.dataset.agentId);
     return;
@@ -618,13 +942,23 @@ document.querySelector("#themeToggle").addEventListener("click", () => {
   applyTheme(nextTheme, true);
 });
 
+document.querySelector("#historyToggle").addEventListener("click", () => {
+  toggleHistory(document.querySelector("#historyPanel").hidden, true);
+});
+
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     clearTimeout(pollTimer);
+    clearInterval(historyTimer);
+    historyTimer = null;
     return;
   }
   backoff = 1000;
   schedule(0);
+  if (!document.querySelector("#historyPanel").hidden) {
+    fetchHistory();
+    historyTimer = setInterval(fetchHistory, HISTORY_REFRESH_MS);
+  }
 });
 
 setInterval(() => {
@@ -640,4 +974,11 @@ setInterval(() => {
 }, 1000);
 
 applyTheme(document.documentElement.dataset.theme);
+try {
+  if (localStorage.getItem(STORAGE_KEYS.historyOpen) === "1") {
+    toggleHistory(true);
+  }
+} catch {
+  // 无本地存储时保持默认折叠。
+}
 poll();

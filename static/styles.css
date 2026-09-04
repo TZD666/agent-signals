@@ -196,6 +196,187 @@ h1 {
   line-height: 1.55;
 }
 
+.history-toggle.is-active {
+  border-color: rgba(var(--thinking), 0.55);
+  background: rgba(var(--thinking), 0.14);
+  color: rgb(var(--thinking));
+}
+
+.history-panel {
+  margin-top: 18px;
+  padding: 18px 20px 20px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel);
+}
+
+.history-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.history-heading h2 {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 560;
+  letter-spacing: -0.02em;
+}
+
+.history-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.history-live h3,
+.history-list h3 {
+  margin: 18px 0 8px;
+  color: #858b94;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+}
+
+.history-empty {
+  margin: 14px 0 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.history-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  margin-top: 6px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.018);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 160ms ease,
+    background 160ms ease;
+}
+
+.history-row:hover,
+.history-row:focus-visible {
+  outline: none;
+  border-color: rgba(var(--thinking), 0.4);
+  background: rgba(var(--thinking), 0.05);
+}
+
+.history-row.is-live {
+  border-color: rgba(var(--thinking), 0.3);
+}
+
+.history-main {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.history-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgb(var(--status, var(--idle)));
+  box-shadow: 0 0 9px rgba(var(--status, var(--idle)), 0.6);
+}
+
+.history-dot.status-idle { --status: var(--idle); }
+.history-dot.status-thinking { --status: var(--thinking); }
+.history-dot.status-completed { --status: var(--completed); }
+.history-dot.status-needs_input { --status: var(--needs-input); }
+.history-dot.status-stalled { --status: var(--stalled); }
+.history-dot.status-error { --status: var(--error); }
+
+.history-name {
+  overflow: hidden;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 560;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-tag {
+  flex: none;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.cost-badge {
+  flex: none;
+  margin-left: auto;
+  padding: 2px 9px;
+  border: 1px solid rgba(var(--completed), 0.35);
+  border-radius: 999px;
+  color: rgb(var(--completed));
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.cost-badge.is-estimate {
+  border-color: rgba(var(--needs-input), 0.4);
+  color: rgb(var(--needs-input));
+}
+
+.history-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.history-model {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-sub {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.history-turns {
+  margin: 4px 0 2px 17px;
+  padding: 4px 0 4px 12px;
+  border-left: 1px solid var(--line);
+}
+
+.turn-row {
+  display: flex;
+  gap: 12px;
+  padding: 4px 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.turn-row span:last-child {
+  margin-left: auto;
+  color: var(--text);
+}
+
 .sources {
   display: flex;
   align-items: center;
@@ -687,6 +868,58 @@ h2 span {
   font-variant-numeric: tabular-nums;
 }
 
+.agent-load {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  margin-top: 6px;
+}
+
+.load-bar {
+  overflow: hidden;
+  width: 56px;
+  height: 3px;
+  flex: none;
+  border-radius: 999px;
+  background: rgba(var(--status), 0.14);
+}
+
+.load-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: rgba(var(--status), 0.78);
+  transition: width 300ms ease;
+}
+
+/* 读不到数据 ≠ 没有数据：未知负载画斜纹，绝不画 0%。 */
+.load-bar.is-unknown {
+  background: repeating-linear-gradient(
+    135deg,
+    rgba(var(--status), 0.12) 0 4px,
+    transparent 4px 8px
+  );
+}
+
+.load-text {
+  overflow: hidden;
+  color: #5f6670;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-load.is-high .load-bar i {
+  background: rgb(var(--needs-input));
+  box-shadow: 0 0 6px rgba(var(--needs-input), 0.45);
+}
+
+.agent-load.is-high .load-text {
+  color: rgb(var(--needs-input));
+}
+
 .agent-meta {
   display: flex;
   align-items: center;
@@ -912,8 +1145,13 @@ footer p {
 }
 
 :root[data-theme="light"] .agent-meta,
+:root[data-theme="light"] .load-text,
 :root[data-theme="light"] .satellite-overflow {
   color: #737e8f;
+}
+
+:root[data-theme="light"] .agent-load.is-high .load-text {
+  color: rgb(var(--needs-input));
 }
 
 :root[data-theme="light"] .source {
@@ -969,6 +1207,20 @@ footer p {
   border-color: rgba(var(--error), 0.28);
   background: rgba(255, 247, 248, 0.97);
   color: #8f2933;
+}
+
+:root[data-theme="light"] .history-row {
+  background: rgba(255, 255, 255, 0.65);
+}
+
+:root[data-theme="light"] .history-row:hover,
+:root[data-theme="light"] .history-row:focus-visible {
+  background: rgba(var(--thinking), 0.06);
+}
+
+:root[data-theme="light"] .history-live h3,
+:root[data-theme="light"] .history-list h3 {
+  color: #5d6675;
 }
 
 @keyframes live {
@@ -1133,6 +1385,14 @@ footer p {
     border-radius: 16px;
   }
 
+  .agent-load {
+    margin-top: 4px;
+  }
+
+  .load-text {
+    font-size: 9px;
+  }
+
   .agent-control {
     top: 9px;
   }
@@ -1147,6 +1407,19 @@ footer p {
 
   .section-heading > p {
     display: none;
+  }
+
+  .history-panel {
+    padding: 14px 14px 16px;
+  }
+
+  .history-info {
+    flex-wrap: wrap;
+    white-space: normal;
+  }
+
+  .history-model {
+    width: 100%;
   }
 
   footer {

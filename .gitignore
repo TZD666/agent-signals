@@ -15,3 +15,6 @@ node_modules/
 
 # macOS
 .DS_Store
+
+# SDD / plan scratch (never commit)
+.superpowers/
