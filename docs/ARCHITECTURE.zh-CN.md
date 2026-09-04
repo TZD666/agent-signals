@@ -33,7 +33,9 @@
 
 桌面 App 的会话还会和它自己的会话索引对一次（`~/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json`，按 `cliSessionId` 关联，60 秒缓存，坏文件跳过）：索引里的标题盖掉自动生成的会话名（自己起的名字不动），点灯打开的是 Claude.app 而不是 Terminal 标签页。
 
-`claude -p` 的登记表不写 `status`，照原来的读法它永远是一盏假的白灯。这种会话改看活动信号：`AGENT_SIGNALS_CLAUDE_HEADLESS_ACTIVE_MS`（默认 30 秒）内还有 CPU 增量或 transcript 写入就算思考中，静下来即转已完成。它没有可以切过去的界面，所以点不开。
+`claude -p` 和桌面 App 的登记表都不写 `status`（已在本机实测），照原来的读法它们永远是一盏假的白灯。这两种会话改看活动信号：`AGENT_SIGNALS_CLAUDE_HEADLESS_ACTIVE_MS`（默认 30 秒）内还有 CPU 增量或 transcript 写入就算思考中，静下来即转已完成；同样缺状态时间戳，时间优先取桌面索引的 `lastActivityAt`，没有索引才退回 `startedAt`。
+
+「状态要自己推」和「点不开」是两件事：桌面 App 的灯点一下会把 Claude.app 拉到前台，只有真正的 `claude -p` 没有可切过去的界面。打不开的灯转绿之后仍然可以点一下——服务不打开任何窗口，只把这次完成确认掉，否则它会一直绿在那儿。
 
 ## 卫星
 

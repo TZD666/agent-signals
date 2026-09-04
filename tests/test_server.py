@@ -966,7 +966,7 @@ class ClaudeFamilyTests(unittest.TestCase):
         ), patch.object(server, "command_lines", return_value=commands):
             return server.load_claude_sessions(current, table)
 
-    def desktop_entry(self, root, cli_session_id, title):
+    def desktop_entry(self, root, cli_session_id, title, last_activity=CLAUDE_NOW):
         folder = root / "desktop" / "claude-code-sessions" / "acct" / "org"
         folder.mkdir(parents=True, exist_ok=True)
         (folder / f"local_{cli_session_id}.json").write_text(
@@ -977,7 +977,7 @@ class ClaudeFamilyTests(unittest.TestCase):
                     "cwd": "/tmp/project",
                     "title": title,
                     "titleSource": "generated",
-                    "lastActivityAt": CLAUDE_NOW,
+                    "lastActivityAt": last_activity,
                     "isArchived": False,
                 }
             ),
@@ -1082,6 +1082,55 @@ class ClaudeFamilyTests(unittest.TestCase):
         self.assertEqual(agents[0]["detail"], "claude -p 后台")
         # 没有 statusUpdatedAt/updatedAt 时退回 startedAt，而不是 0。
         self.assertEqual(agents[0]["updatedAt"], CLAUDE_NOW)
+
+    def test_desktop_session_without_status_is_still_openable(self):
+        # 桌面 App 的登记表和 `claude -p` 一样不写 status，但它点得开：
+        # 状态要自己推 ≠ 打不开，这两件事必须分开。
+        sessions = [
+            registry(
+                210,
+                status=None,
+                updatedAt=None,
+                startedAt=CLAUDE_NOW - 60_000,
+                entrypoint="claude-desktop",
+                name="terminal-210",
+                nameSource="derived",
+                bridgeSessionId="bridge-1",
+            ),
+            registry(
+                211,
+                status=None,
+                updatedAt=None,
+                startedAt=CLAUDE_NOW - 60_000,
+                entrypoint="sdk-cli",
+            ),
+        ]
+        commands = {
+            210: (
+                "/Users/edy/Library/Application Support/Claude/claude-code/"
+                "2.0.76/claude.app/Contents/MacOS/claude"
+            ),
+            211: "claude -p 巡检",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.desktop_entry(
+                root, "s210", "5分钟空任务测试", last_activity=CLAUDE_NOW - 5_000
+            )
+            agents, _ = self.sample(root, sessions, commands)
+        by_pid = {agent["pid"]: agent for agent in agents}
+        desktop = by_pid[210]
+        self.assertTrue(desktop["openable"])
+        self.assertEqual(desktop["openVia"], "app:Claude")
+        self.assertEqual(desktop["detail"], "桌面 App")
+        self.assertEqual(desktop["name"], "5分钟空任务测试")
+        # 没有 status 字段，状态照样按活动推出来。
+        self.assertEqual(desktop["status"], "thinking")
+        # 没有状态时间戳时，索引的 lastActivityAt 比 startedAt 更贴近真实活动。
+        self.assertEqual(desktop["updatedAt"], CLAUDE_NOW - 5_000)
+        # 真正的 `claude -p` 依旧点不开，时间戳只能退回 startedAt。
+        self.assertFalse(by_pid[211]["openable"])
+        self.assertEqual(by_pid[211]["updatedAt"], CLAUDE_NOW - 60_000)
 
     def test_background_session_attaches_to_ppid_ancestor(self):
         sessions = [

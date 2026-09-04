@@ -33,7 +33,7 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 SCHEMA_VERSION = 1
 
 ROOT = Path(__file__).resolve().parent
@@ -783,26 +783,33 @@ def load_claude_sessions(
     for data in sessions:
         pid = int(data.get("pid") or 0)
         alive = process_alive(pid, commands)
-        updated_at = normalize_ms(
-            data.get("statusUpdatedAt")
-            or data.get("updatedAt")
-            # headless 的登记表两个都不写，只有 startedAt。
-            or data.get("startedAt")
-        )
         session_id = str(data.get("sessionId") or pid)
         kind = str(data.get("kind") or "interactive")
         entrypoint = claude_entrypoint(data, scanned.get(pid) or commands.get(pid, ""))
+        desktop = desktop_index.get(session_id)
+        updated_at = normalize_ms(
+            data.get("statusUpdatedAt") or data.get("updatedAt")
+        )
+        if not updated_at:
+            # `claude -p` 和桌面 App 的登记表都不写状态时间戳。桌面索引的
+            # lastActivityAt 最贴近真实活动，没有索引才退回 startedAt。
+            updated_at = normalize_ms(
+                (desktop or {}).get("lastActivityAt") or data.get("startedAt")
+            )
 
         # note_activity 每轮采样只算一次，提前调用不改变它的结果；
-        # headless 会话没有 status 字段，只能拿它的 quietSince 反推。
+        # 没有 status 字段的会话只能拿它的 quietSince 反推状态。
         quiet_since = note_activity(
             completion_key("claude", session_id),
             tree_cpu(pid, table),
             transcript_mtime(session_id),
             current_ms,
         )
-        headless = "status" not in data
-        if headless:
+        # 两件不同的事：状态得自己推（`claude -p` 和桌面 App 都不写 status），
+        # 和打不开（只有真正的 `claude -p` 没有可切过去的界面）。
+        derive_status = "status" not in data
+        headless_cli = entrypoint == "sdk-cli"
+        if derive_status:
             raw_status = (
                 "busy"
                 if current_ms - quiet_since < CLAUDE_HEADLESS_ACTIVE_MS
@@ -825,7 +832,6 @@ def load_claude_sessions(
         name = str(data.get("name") or "")
         detail = ENTRYPOINT_LABELS.get(entrypoint, entrypoint or "Terminal")
         open_via = "app:Claude" if entrypoint == "claude-desktop" else "tty"
-        desktop = desktop_index.get(session_id)
         if desktop is not None:
             # 自动起的名字让位给桌面 App 自己的标题，手起的名字不动。
             if str(data.get("nameSource") or "") == "derived" or not name:
@@ -845,8 +851,8 @@ def load_claude_sessions(
             "updatedAt": updated_at,
             "quietSince": quiet_since,
             "completionId": completion_id if status == "completed" else 0,
-            # headless 会话没有可切过去的界面，点了也没有意义。
-            "openable": alive and kind == "interactive" and not headless,
+            # 只有真正的 `claude -p` 打不开：桌面 App 的会话点了能把 Claude.app 拉到前台。
+            "openable": alive and kind == "interactive" and not headless_cli,
             # 这一批灯全部来自登记表；进程发现器认领的那些走别的 origin。
             "origin": "registry",
             "openVia": open_via,
