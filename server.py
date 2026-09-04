@@ -12,9 +12,10 @@ import sqlite3
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 
@@ -32,6 +33,7 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
+APP_VERSION = "2.1.1"
 SCHEMA_VERSION = 1
 
 ROOT = Path(__file__).resolve().parent
@@ -42,6 +44,12 @@ CLAUDE_SESSIONS_DIR = Path(
 CLAUDE_PROJECTS_DIR = Path(
     os.environ.get("CLAUDE_PROJECTS_DIR", "~/.claude/projects")
 ).expanduser()
+CLAUDE_DESKTOP_SUPPORT_DIR = Path(
+    os.environ.get(
+        "CLAUDE_DESKTOP_SUPPORT_DIR",
+        Path.home() / "Library" / "Application Support" / "Claude",
+    )
+).expanduser()
 CODEX_DIR = Path(os.environ.get("CODEX_DIR", "~/.codex")).expanduser()
 CODEX_DB_PATH = (
     Path(os.environ["CODEX_DB_PATH"]).expanduser()
@@ -51,10 +59,19 @@ CODEX_DB_PATH = (
 STATE_PATH = Path(
     os.environ.get("AGENT_SIGNALS_STATE_PATH", ROOT / ".agent-signals-state.json")
 ).expanduser()
+SERVER_STARTED_AT_MS = int(time.time() * 1000)
 
 VISIBLE_WINDOW_MS = 48 * 60 * 60 * 1000
 RECENT_ERROR_MS = 5 * 60 * 1000
 MAX_CODEX_THREADS = 30
+# Real rollouts carry single events of tens of KB; 512KB of tail held only ~25
+# lines and let every status marker scroll out of view on long turns.
+CODEX_TAIL_BYTES = 4_000_000
+CLAUDE_TAIL_BYTES = 1_000_000
+# The Claude transcript never states the model context window; env-tunable.
+CLAUDE_CONTEXT_WINDOW = env_int("AGENT_SIGNALS_CLAUDE_CONTEXT_WINDOW", 200_000)
+STEP_GAP_MAX_SAMPLES = 10
+STEP_GAP_OUTLIER_MS = 30 * 60 * 1000
 
 STALL_AFTER_MS = env_int("AGENT_SIGNALS_STALL_AFTER_MS", 180_000)
 CPU_EPSILON = env_float("AGENT_SIGNALS_CPU_EPSILON", 0.05)
@@ -66,6 +83,75 @@ NOTIFY_MAX_PER_MINUTE = env_int("AGENT_SIGNALS_NOTIFY_MAX_PER_MINUTE", 10)
 NOTIFY_ENABLED = os.environ.get("AGENT_SIGNALS_NOTIFY", "1") != "0"
 LOCKED_ID_TTL_MS = 10 * 60 * 1000
 
+# headless 的 `claude -p` 登记表不写 status，只能按「还有没有活动」自己判。
+CLAUDE_HEADLESS_ACTIVE_MS = env_int("AGENT_SIGNALS_CLAUDE_HEADLESS_ACTIVE_MS", 30_000)
+# Task 子代理没有结束标记，只能看它那条 jsonl 多久没写了。
+SUBAGENT_ACTIVE_MS = env_int("AGENT_SIGNALS_SUBAGENT_ACTIVE_MS", 60_000)
+SUBAGENT_LINGER_MS = env_int("AGENT_SIGNALS_SUBAGENT_LINGER_MS", 600_000)
+# 一轮采样内多次取快照时不重复列目录 / 重扫桌面索引。
+SUBAGENT_LIST_TTL_MS = 5_000
+DESKTOP_INDEX_TTL_S = 60.0
+# 桌面 App 自带一份 claude 二进制，登记表没写 entrypoint 时只能靠它认。
+DESKTOP_COMMAND_MARKER = "Application Support/Claude/claude-code/"
+
+# ---- 历史埋点与费用估算（history / cost estimation） ----
+HISTORY_ENABLED = os.environ.get("AGENT_SIGNALS_HISTORY", "1") != "0"
+HISTORY_DB_PATH = Path(
+    os.environ.get("AGENT_SIGNALS_HISTORY_DB", ROOT / "agent-history.db")
+).expanduser()
+CODEX_PRICES_PATH = Path(
+    os.environ.get("AGENT_SIGNALS_CODEX_PRICES", ROOT / "codex_prices.json")
+).expanduser()
+CLAUDE_PRICES_PATH = Path(
+    os.environ.get(
+        "AGENT_SIGNALS_CLAUDE_PRICES",
+        Path.home()
+        / "Library/Application Support/tokenusage/data/prices.json",
+    )
+).expanduser()
+HISTORY_SCHEMA_VERSION = 1
+HISTORY_INTERVAL_MS = env_int("AGENT_SIGNALS_HISTORY_INTERVAL_MS", 60_000)
+HISTORY_BACKFILL_DAYS = env_int("AGENT_SIGNALS_HISTORY_BACKFILL_DAYS", 30)
+HISTORY_RETENTION_DAYS = env_int("AGENT_SIGNALS_HISTORY_RETENTION_DAYS", 90)
+HISTORY_TURNS_RETENTION_DAYS = env_int(
+    "AGENT_SIGNALS_HISTORY_TURNS_RETENTION_DAYS", 30
+)
+HISTORY_INGEST_BYTE_BUDGET = env_int(
+    "AGENT_SIGNALS_HISTORY_BYTE_BUDGET", 32_000_000
+)
+
+# Claude 兜底价目表，$/MTok：(input, output, cache_read, cache_write_5m)。
+# 正常路径读 tokenusage 的 prices.json（LiteLLM 镜像，每分钟自动刷新）；
+# 这张表只在镜像缺失/损坏时使用。同步源：tokenusage ingest.py 的 _FALLBACK_PRICING。
+CLAUDE_FALLBACK_PRICES_MTOK = {
+    "claude-fable-5": (10.00, 50.00, 1.00, 12.50),
+    "claude-mythos-5": (10.00, 50.00, 1.00, 12.50),
+    "claude-opus-5": (5.00, 25.00, 0.50, 6.25),
+    "claude-opus-4-5": (5.00, 25.00, 0.50, 6.25),
+    "claude-opus-4-6": (5.00, 25.00, 0.50, 6.25),
+    "claude-opus-4-7": (5.00, 25.00, 0.50, 6.25),
+    "claude-opus-4-8": (5.00, 25.00, 0.50, 6.25),
+    "claude-opus-4": (15.00, 75.00, 1.50, 18.75),
+    "claude-sonnet-5": (2.00, 10.00, 0.20, 2.50),
+    "claude-sonnet-4": (3.00, 15.00, 0.30, 3.75),
+    "claude-haiku-4": (1.00, 5.00, 0.10, 1.25),
+}
+
+# Codex/GPT 播种价目表，$/MTok。本机没有权威 GPT 价格源，这里按 OpenAI 公开
+# 标价填初始值，属于估算；文件生成后完全由用户编辑，服务只在文件缺失时播种。
+CODEX_SEED_PRICES = {
+    "_note": "Codex 估算价格（美元/百万 token）。可手工编辑，改完即生效；"
+    "未收录的模型金额显示为 —，绝不编造。",
+    "_unit": "usd_per_mtok",
+    "models": {
+        "gpt-5": {"input": 1.25, "cached_input": 0.125, "output": 10.0},
+        "gpt-5-codex": {"input": 1.25, "cached_input": 0.125, "output": 10.0},
+        "gpt-5.1": {"input": 1.25, "cached_input": 0.125, "output": 10.0},
+        "gpt-5-mini": {"input": 0.25, "cached_input": 0.025, "output": 2.0},
+        "gpt-5-nano": {"input": 0.05, "cached_input": 0.005, "output": 0.4},
+    },
+}
+
 STATUS_LABELS = {
     "idle": "空闲",
     "thinking": "思考中",
@@ -75,6 +161,19 @@ STATUS_LABELS = {
     "error": "错误",
 }
 NOTIFY_STATUSES = ("needs_input", "stalled", "completed")
+
+# 登记表里的 entrypoint 原样来自 $CLAUDE_CODE_ENTRYPOINT。认不出的原样显示。
+ENTRYPOINT_LABELS = {
+    "cli": "Terminal",
+    "claude-desktop": "桌面 App",
+    "claude-vscode": "VS Code",
+    "sdk-cli": "claude -p 后台",
+    "sdk-ts": "SDK",
+    "sdk-py": "SDK",
+    "mcp": "MCP",
+    "local-agent": "桌面 Cowork",
+    "local_agent": "桌面 Cowork",
+}
 
 CODEX_CORE_COLUMNS = frozenset({"id", "cwd", "source", "rollout_path"})
 CODEX_ACTIVITY_COLUMNS = (
@@ -102,8 +201,11 @@ JSON_FRAGMENT_MARKERS = ('"}]}', '"}]', '"},{', '{"type"', '[{"', '"}', '}]', ']
 
 _claude_transitions: dict[str, dict[str, int | str]] = {}
 _activity: dict[str, dict[str, float]] = {}
-_rollout_cache: dict[str, tuple[tuple[float, int], tuple[str, int]]] = {}
+_rollout_cache: dict[str, tuple[tuple[float, int], tuple[str, int, dict[str, Any]]]] = {}
+_claude_load_cache: dict[str, tuple[tuple[float, int], dict[str, Any]]] = {}
 _transcript_paths: dict[str, Path] = {}
+_subagent_cache: dict[str, tuple[int, list[dict[str, Any]]]] = {}
+_desktop_index_cache: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
 _state_lock = threading.Lock()
 
 _snapshot_ready = threading.Condition()
@@ -115,6 +217,8 @@ _notified: dict[str, int] = {}
 _notify_history: list[int] = []
 _notify_primed = False
 _notify_health: dict[str, str] = {"state": "unknown", "detail": ""}
+_price_cache: dict[str, tuple[float, dict[str, dict[str, float]]]] = {}
+_history_health: dict[str, Any] = {"state": "initializing", "detail": ""}
 
 
 def load_acknowledged_completions() -> dict[str, int]:
@@ -175,6 +279,9 @@ def acknowledge_agent(agent: dict[str, Any]) -> bool:
         for item in [agent, *(agent.get("satellites") or [])]:
             if item.get("status") != "completed":
                 continue
+            # 子代理卫星是一次性的信息展示，别把它们的 id 永久写进状态文件。
+            if item.get("origin") == "subagent":
+                continue
             completion_id = int(item.get("completionId") or 0)
             key = completion_key(platform, str(item.get("id") or ""))
             if completion_id > _acknowledged_completions.get(key, 0):
@@ -183,6 +290,14 @@ def acknowledge_agent(agent: dict[str, Any]) -> bool:
         if changed:
             save_acknowledged_completions()
     return changed
+
+
+def is_preexisting_completion(status: str, completion_id: int) -> bool:
+    return (
+        status == "completed"
+        and completion_id > 0
+        and completion_id < SERVER_STARTED_AT_MS
+    )
 
 
 def now_ms() -> int:
@@ -208,50 +323,91 @@ def parse_cpu_time(value: str) -> float:
     return total
 
 
+def parse_etime(value: str) -> int:
+    """ps 的 etime：`ss` / `mm:ss` / `hh:mm:ss` / `dd-hh:mm:ss`，返回整秒。"""
+    text = value.strip()
+    if not text:
+        return 0
+    days = 0
+    if "-" in text:
+        head, _, text = text.partition("-")
+        try:
+            days = int(head)
+        except ValueError:
+            return 0
+    seconds = 0
+    for part in text.split(":"):
+        try:
+            seconds = seconds * 60 + int(part)
+        except ValueError:
+            return 0
+    return days * 86_400 + seconds
+
+
+def empty_process_table() -> dict[str, Any]:
+    return {"children": {}, "cpu": {}, "commands": {}, "start_s": {}, "uid": {}}
+
+
+# 最近一次 scan_processes() 的结果：command_lines 优先读它，省掉每轮的 ps -p。
+_last_table: dict[str, Any] = empty_process_table()
+
+
 def scan_processes() -> dict[str, Any]:
-    """One ps sweep per sample for CPU accounting; command lines cost extra."""
-    table: dict[str, Any] = {"children": {}, "cpu": {}}
+    """One ps sweep per sample: parentage, CPU, command line, start time, uid."""
+    global _last_table
+    table = empty_process_table()
     try:
         result = subprocess.run(
-            ["ps", "-A", "-o", "pid=,ppid=,time="],
+            ["ps", "-axo", "pid=,ppid=,uid=,time=,etime=,command="],
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
+        _last_table = table
         return table
 
+    current_s = now_ms() // 1000
     for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 3:
+        # command= 是最后一列且含空格，限定 maxsplit 让它整段活下来。
+        parts = line.split(None, 5)
+        if len(parts) < 5:
             continue
         try:
-            pid, parent = int(parts[0]), int(parts[1])
+            pid, parent, uid = int(parts[0]), int(parts[1]), int(parts[2])
         except ValueError:
             continue
-        table["cpu"][pid] = parse_cpu_time(parts[2])
+        table["cpu"][pid] = parse_cpu_time(parts[3])
         table["children"].setdefault(parent, []).append(pid)
+        table["start_s"][pid] = current_s - parse_etime(parts[4])
+        table["uid"][pid] = uid
+        table["commands"][pid] = parts[5] if len(parts) > 5 else ""
+    _last_table = table
     return table
 
 
 def command_lines(pids: set[int]) -> dict[int, str]:
-    """Full command lines, asked for only the handful of pids we care about."""
+    """Full command lines, served from the last sweep; ps only for the strays."""
     wanted = sorted(pid for pid in pids if pid > 0)
     if not wanted:
         return {}
+    scanned: dict[int, str] = _last_table["commands"]
+    commands = {pid: scanned[pid] for pid in wanted if pid in scanned}
+    missing = [pid for pid in wanted if pid not in scanned]
+    if not missing:
+        return commands
     try:
         result = subprocess.run(
-            ["ps", "-p", ",".join(str(pid) for pid in wanted), "-o", "pid=,command="],
+            ["ps", "-p", ",".join(str(pid) for pid in missing), "-o", "pid=,command="],
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return {}
+        return commands
 
-    commands: dict[int, str] = {}
     for line in result.stdout.splitlines():
         parts = line.split(None, 1)
         if len(parts) < 2:
@@ -287,22 +443,82 @@ def process_alive(pid: int, commands: dict[int, str] | None = None) -> bool:
     return "claude" in command and "--bg-spare" not in command
 
 
-def transcript_mtime(session_id: str) -> float:
-    """Last write to the session transcript, our Claude-side activity signal."""
+def transcript_path(session_id: str) -> Path | None:
+    """Resolve (and cache) the transcript path for a session."""
     cached = _transcript_paths.get(session_id)
     if cached is not None:
-        try:
-            return cached.stat().st_mtime
-        except OSError:
-            _transcript_paths.pop(session_id, None)
+        if cached.exists():
+            return cached
+        _transcript_paths.pop(session_id, None)
     for path in CLAUDE_PROJECTS_DIR.glob(f"*/{session_id}.jsonl"):
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            continue
         _transcript_paths[session_id] = path
-        return mtime
-    return 0.0
+        return path
+    return None
+
+
+def transcript_mtime(session_id: str) -> float:
+    """Last write to the session transcript, our Claude-side activity signal."""
+    path = transcript_path(session_id)
+    if path is None:
+        return 0.0
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def claude_load(session_id: str) -> dict[str, Any]:
+    """Context weight and step cadence from the transcript tail."""
+    path = transcript_path(session_id)
+    if path is None:
+        return empty_load()
+    signature = rollout_signature(path)
+    if signature is not None:
+        cached = _claude_load_cache.get(session_id)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+
+    usage: dict[str, Any] | None = None
+    step_times: list[int] = []
+    last_request_id: Any = object()
+    for line in read_tail_json(path, CLAUDE_TAIL_BYTES):
+        if str(line.get("type") or "") != "assistant":
+            continue
+        message = line.get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("usage"), dict):
+            continue
+        usage = message["usage"]
+        stamp = parse_iso_ms(line.get("timestamp"))
+        if stamp:
+            request_id = line.get("requestId")
+            # Streamed content blocks of one request repeat the same usage;
+            # they are one step, so only their newest timestamp counts.
+            if request_id is not None and request_id == last_request_id and step_times:
+                step_times[-1] = stamp
+            else:
+                note_step(step_times, stamp)
+            last_request_id = request_id
+
+    tokens = None
+    if usage is not None:
+        try:
+            tokens = (
+                int(usage.get("input_tokens") or 0)
+                + int(usage.get("cache_read_input_tokens") or 0)
+                + int(usage.get("cache_creation_input_tokens") or 0)
+            )
+        except (TypeError, ValueError):
+            tokens = None
+    load = build_load(
+        tokens,
+        CLAUDE_CONTEXT_WINDOW if CLAUDE_CONTEXT_WINDOW > 0 else None,
+        step_times,
+    )
+    if signature is not None:
+        if len(_claude_load_cache) > 200:
+            _claude_load_cache.clear()
+        _claude_load_cache[session_id] = (signature, load)
+    return load
 
 
 def note_activity(key: str, cpu: float, mtime: float, current_ms: int) -> int:
@@ -379,6 +595,166 @@ def claude_status(
     return "completed" if mapped == "idle" and completed_at else mapped
 
 
+def load_desktop_index() -> dict[str, dict[str, Any]]:
+    """桌面 App 的会话索引，按 cliSessionId 建表；60 秒一刷，坏文件跳过。"""
+    root = CLAUDE_DESKTOP_SUPPORT_DIR / "claude-code-sessions"
+    key = str(root)
+    now = time.time()
+    cached = _desktop_index_cache.get(key)
+    if cached is not None and 0 <= now - cached[0] < DESKTOP_INDEX_TTL_S:
+        return cached[1]
+
+    index: dict[str, dict[str, Any]] = {}
+    if root.is_dir():
+        # 布局是 <账号>/<组织>/local_<uuid>.json。
+        for path in sorted(root.glob("*/*/local_*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            cli_session_id = str(data.get("cliSessionId") or "")
+            if not cli_session_id:
+                continue
+            index[cli_session_id] = {
+                "title": str(data.get("title") or ""),
+                "model": str(data.get("model") or ""),
+                "cwd": str(data.get("cwd") or data.get("originCwd") or ""),
+                "lastActivityAt": normalize_ms(data.get("lastActivityAt")),
+                "isArchived": bool(data.get("isArchived")),
+            }
+    _desktop_index_cache[key] = (now, index)
+    return index
+
+
+def claude_entrypoint(data: dict[str, Any], command: str) -> str:
+    """登记表写了就用它；没写时只有命令行能认出桌面 App 自带的那个二进制。"""
+    entrypoint = str(data.get("entrypoint") or "").strip()
+    if entrypoint:
+        return entrypoint
+    return "claude-desktop" if DESKTOP_COMMAND_MARKER in command else ""
+
+
+def parent_map(table: dict[str, Any]) -> dict[int, int]:
+    """把 ps 表的 children 反过来：子 pid → 父 pid。"""
+    parents: dict[int, int] = {}
+    for parent, kids in (table.get("children") or {}).items():
+        for kid in kids:
+            parents[kid] = parent
+    return parents
+
+
+def claude_host(
+    pid: int, parents: dict[int, int], hosts: dict[int, dict[str, Any]], depth: int = 8
+) -> dict[str, Any] | None:
+    """沿 PPID 链上溯，找第一个属于前台 Claude 会话的祖先；找不到返回 None。"""
+    current = parents.get(pid, 0)
+    for _ in range(depth):
+        if current <= 0:
+            return None
+        host = hosts.get(current)
+        if host is not None:
+            return host
+        current = parents.get(current, 0)
+    return None
+
+
+def satellite_of(agent: dict[str, Any], origin: str) -> dict[str, Any]:
+    """卫星只带这几个字段——尤其不带 load，卫星永远是轻量的。"""
+    return {
+        "id": agent["id"],
+        "name": agent["name"],
+        "status": agent["status"],
+        "completionId": agent["completionId"],
+        "origin": origin,
+    }
+
+
+def scan_subagents(session_id: str) -> list[dict[str, Any]]:
+    """列出 Task 子代理文件：只 stat jsonl，只读同名的小 meta，不碰对话内容。"""
+    parent = transcript_path(session_id)
+    if parent is None:
+        return []
+    directory = parent.parent / session_id / "subagents"
+    if not directory.is_dir():
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for meta_path in sorted(directory.glob("agent-*.meta.json")):
+        stem = meta_path.name[: -len(".meta.json")]
+        try:
+            mtime_ms = int(directory.joinpath(f"{stem}.jsonl").stat().st_mtime * 1000)
+        except OSError:
+            continue
+        name = stem
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            meta = None
+        if isinstance(meta, dict):
+            agent_type = str(meta.get("agentType") or "").strip()
+            description = clean_label(str(meta.get("description") or ""))
+            if agent_type and description:
+                name = f"{agent_type} · {description}"
+            else:
+                name = agent_type or description or stem
+        entries.append({"id": stem, "name": name, "mtimeMs": mtime_ms})
+    return entries
+
+
+def subagent_satellites(session_id: str, current_ms: int) -> list[dict[str, Any]]:
+    """Task 子代理当卫星：jsonl 还在动就是思考中，静下来一阵后不再显示。"""
+    cached = _subagent_cache.get(session_id)
+    if cached is not None and 0 <= current_ms - cached[0] < SUBAGENT_LIST_TTL_MS:
+        entries = cached[1]
+    else:
+        entries = scan_subagents(session_id)
+        if len(_subagent_cache) > 200:
+            _subagent_cache.clear()
+        _subagent_cache[session_id] = (current_ms, entries)
+
+    satellites: list[dict[str, Any]] = []
+    for entry in entries:
+        quiet_for = current_ms - int(entry["mtimeMs"])
+        if quiet_for >= SUBAGENT_LINGER_MS:
+            continue
+        done = quiet_for >= SUBAGENT_ACTIVE_MS
+        satellites.append(
+            {
+                "id": entry["id"],
+                "name": entry["name"],
+                "status": "completed" if done else "thinking",
+                "completionId": int(entry["mtimeMs"]) if done else 0,
+                "origin": "subagent",
+            }
+        )
+    return satellites
+
+
+def claude_claimed_pids(table: dict[str, Any]) -> set[int]:
+    """登记表里的每个 pid 及其全部子孙——给进程发现器去重用。"""
+    claimed: set[int] = set()
+    if not CLAUDE_SESSIONS_DIR.exists():
+        return claimed
+    children = table.get("children") or {}
+    stack: list[int] = []
+    for path in sorted(CLAUDE_SESSIONS_DIR.glob("*.json")):
+        try:
+            pid = int(json.loads(path.read_text(encoding="utf-8")).get("pid") or 0)
+        except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+            continue
+        if pid > 0:
+            stack.append(pid)
+    while stack:
+        pid = stack.pop()
+        if pid in claimed:
+            continue
+        claimed.add(pid)
+        stack.extend(children.get(pid, ()))
+    return claimed
+
+
 def load_claude_sessions(
     current_ms: int | None = None, table: dict[str, Any] | None = None
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
@@ -400,72 +776,130 @@ def load_claude_sessions(
         except (OSError, json.JSONDecodeError):
             continue
     commands = command_lines({int(data.get("pid") or 0) for data in sessions})
+    scanned = table.get("commands") or {}
+    desktop_index = load_desktop_index()
+    sdk_lights: list[dict[str, Any]] = []
 
     for data in sessions:
         pid = int(data.get("pid") or 0)
         alive = process_alive(pid, commands)
-        updated_at = normalize_ms(data.get("statusUpdatedAt") or data.get("updatedAt"))
         session_id = str(data.get("sessionId") or pid)
-        status = claude_status(
-            session_id,
-            str(data.get("status") or "idle"),
-            alive,
-            updated_at,
-            current_ms,
+        kind = str(data.get("kind") or "interactive")
+        entrypoint = claude_entrypoint(data, scanned.get(pid) or commands.get(pid, ""))
+        desktop = desktop_index.get(session_id)
+        updated_at = normalize_ms(
+            data.get("statusUpdatedAt") or data.get("updatedAt")
         )
-        completion_id = int(
-            _claude_transitions.get(session_id, {}).get("completed_at", 0)
-        )
-        if status == "offline":
-            continue
+        if not updated_at:
+            # `claude -p` 和桌面 App 的登记表都不写状态时间戳。桌面索引的
+            # lastActivityAt 最贴近真实活动，没有索引才退回 startedAt。
+            updated_at = normalize_ms(
+                (desktop or {}).get("lastActivityAt") or data.get("startedAt")
+            )
 
+        # note_activity 每轮采样只算一次，提前调用不改变它的结果；
+        # 没有 status 字段的会话只能拿它的 quietSince 反推状态。
         quiet_since = note_activity(
             completion_key("claude", session_id),
             tree_cpu(pid, table),
             transcript_mtime(session_id),
             current_ms,
         )
+        # 两件不同的事：状态得自己推（`claude -p` 和桌面 App 都不写 status），
+        # 和打不开（只有真正的 `claude -p` 没有可切过去的界面）。
+        derive_status = "status" not in data
+        headless_cli = entrypoint == "sdk-cli"
+        if derive_status:
+            raw_status = (
+                "busy"
+                if current_ms - quiet_since < CLAUDE_HEADLESS_ACTIVE_MS
+                else "idle"
+            )
+        else:
+            raw_status = str(data.get("status") or "idle")
+
+        status = claude_status(session_id, raw_status, alive, updated_at, current_ms)
+        completion_id = int(
+            _claude_transitions.get(session_id, {}).get("completed_at", 0)
+        )
+        if status == "offline":
+            continue
+
         status = apply_stall(
             status, current_ms - updated_at, current_ms - quiet_since
         )
+
+        name = str(data.get("name") or "")
+        detail = ENTRYPOINT_LABELS.get(entrypoint, entrypoint or "Terminal")
+        open_via = "app:Claude" if entrypoint == "claude-desktop" else "tty"
+        if desktop is not None:
+            # 自动起的名字让位给桌面 App 自己的标题，手起的名字不动。
+            if str(data.get("nameSource") or "") == "derived" or not name:
+                name = clean_label(str(desktop.get("title") or ""), fallback=name)
+            detail = "桌面 App"
+            open_via = "app:Claude"
 
         agent = {
             "id": session_id,
             "pid": pid,
             "platform": "claude",
-            "name": str(data.get("name") or f"terminal-{pid}"),
+            "name": name or f"terminal-{pid}",
             "status": status,
-            "detail": "Terminal",
+            "detail": detail,
             "cwd": str(data.get("cwd") or ""),
             "cwdLabel": cwd_label(str(data.get("cwd") or "")),
             "updatedAt": updated_at,
             "quietSince": quiet_since,
             "completionId": completion_id if status == "completed" else 0,
-            "openable": alive and str(data.get("kind") or "interactive") == "interactive",
+            # 只有真正的 `claude -p` 打不开：桌面 App 的会话点了能把 Claude.app 拉到前台。
+            "openable": alive and kind == "interactive" and not headless_cli,
+            # 这一批灯全部来自登记表；进程发现器认领的那些走别的 origin。
+            "origin": "registry",
+            "openVia": open_via,
             "satellites": [],
         }
         apply_completion_acknowledgement("claude", agent)
-        if str(data.get("kind") or "interactive") == "interactive":
+        if kind == "interactive":
+            agent["load"] = claude_load(session_id)
             foreground.append(agent)
+            if entrypoint == "sdk-cli":
+                sdk_lights.append(agent)
         else:
             agent["name"] = str(data.get("name") or "后台任务")
             background.append(agent)
 
     foreground.sort(key=lambda item: item["updatedAt"], reverse=True)
+    parents = parent_map(table)
+    # 会被挂走的那些自己不能当宿主，否则卫星可能挂到一盏已经消失的灯上。
+    attachable = {agent["pid"] for agent in background + sdk_lights}
+    hosts = {
+        agent["pid"]: agent
+        for agent in foreground
+        if agent["pid"] > 0 and agent["pid"] not in attachable
+    }
+
+    # `claude -p` 认得出父会话就挂过去，认不出就自己当一盏灯。
+    adopted: set[int] = set()
+    for agent in sdk_lights:
+        host = claude_host(agent["pid"], parents, hosts)
+        if host is not None:
+            host["satellites"].append(satellite_of(agent, "registry"))
+            adopted.add(id(agent))
+    if adopted:
+        foreground = [item for item in foreground if id(item) not in adopted]
+
     for satellite in background:
-        parent = next(
-            (item for item in foreground if item["cwd"] == satellite["cwd"]),
-            foreground[0] if foreground else None,
-        )
-        if parent:
-            parent["satellites"].append(
-                {
-                    "id": satellite["id"],
-                    "name": satellite["name"],
-                    "status": satellite["status"],
-                    "completionId": satellite["completionId"],
-                }
+        parent = claude_host(satellite["pid"], parents, hosts)
+        if parent is None:
+            parent = next(
+                (item for item in foreground if item["cwd"] == satellite["cwd"]),
+                foreground[0] if foreground else None,
             )
+        if parent:
+            parent["satellites"].append(satellite_of(satellite, "registry"))
+
+    for agent in foreground:
+        agent["satellites"].extend(subagent_satellites(agent["id"], current_ms))
     return foreground, {"state": "live", "detail": ""}
 
 
@@ -504,6 +938,56 @@ def parse_iso_ms(value: Any) -> int:
         return 0
 
 
+def empty_load() -> dict[str, Any]:
+    return {
+        "contextTokens": None,
+        "contextWindow": None,
+        "contextPct": None,
+        "stepGapMs": None,
+    }
+
+
+def quantize_step_gap(ms: int) -> int:
+    bucket = 15_000 if ms < 120_000 else 60_000
+    return max(bucket, int(round(ms / float(bucket))) * bucket)
+
+
+def step_gap_ms(timestamps: list[int]) -> int | None:
+    """Average of the recent gaps; anything over the outlier cap is a user pause."""
+    gaps = [
+        later - earlier
+        for earlier, later in zip(timestamps, timestamps[1:])
+        if 0 < later - earlier <= STEP_GAP_OUTLIER_MS
+    ]
+    if not gaps:
+        return None
+    recent = gaps[-STEP_GAP_MAX_SAMPLES:]
+    return quantize_step_gap(int(sum(recent) / len(recent)))
+
+
+def build_load(tokens: Any, window: Any, steps: list[int]) -> dict[str, Any]:
+    """Quantized ints or None only: a float or clock-relative value in the
+    payload would change every sample and defeat the ETag/304 contract."""
+    load = empty_load()
+    if isinstance(tokens, (int, float)) and tokens >= 0:
+        load["contextTokens"] = int(round(tokens / 1000.0)) * 1000
+        # tokens > window means the assumed window is wrong (e.g. a 1M-context
+        # session against the default denominator): admit ignorance, don't show
+        # a fake 100%.
+        if isinstance(window, (int, float)) and 0 < tokens <= window:
+            load["contextWindow"] = int(window)
+            load["contextPct"] = max(0, int(round(tokens * 100.0 / window)))
+    load["stepGapMs"] = step_gap_ms(steps)
+    return load
+
+
+def note_step(step_times: list[int], stamp: int) -> None:
+    if stamp and (not step_times or stamp > step_times[-1]):
+        step_times.append(stamp)
+        if len(step_times) > STEP_GAP_MAX_SAMPLES + 1:
+            step_times.pop(0)
+
+
 def rollout_signature(path: Path) -> tuple[float, int] | None:
     try:
         stat = path.stat()
@@ -512,7 +996,7 @@ def rollout_signature(path: Path) -> tuple[float, int] | None:
     return (stat.st_mtime, stat.st_size)
 
 
-def codex_state(rollout_path: str) -> tuple[str, int]:
+def codex_state(rollout_path: str) -> tuple[str, int, dict[str, Any]]:
     path = Path(rollout_path)
     signature = rollout_signature(path)
     if signature is not None:
@@ -522,10 +1006,20 @@ def codex_state(rollout_path: str) -> tuple[str, int]:
 
     state = "idle"
     state_at = 0
+    token_info: dict[str, Any] | None = None
+    step_times: list[int] = []
     status_events = {
         "task_started": "thinking",
         "agent_reasoning": "thinking",
         "agent_message": "thinking",
+        # Newer Codex builds fill long turns almost exclusively with these
+        # response_item/token_count entries; each only ever appears mid-turn.
+        "reasoning": "thinking",
+        "custom_tool_call": "thinking",
+        "custom_tool_call_output": "thinking",
+        "function_call": "thinking",
+        "function_call_output": "thinking",
+        "token_count": "thinking",
         "task_complete": "completed",
         "turn_aborted": "error",
         "approval_request": "needs_input",
@@ -534,7 +1028,7 @@ def codex_state(rollout_path: str) -> tuple[str, int]:
         "elicitation_request": "needs_input",
     }
 
-    for event in read_tail_json(path):
+    for event in read_tail_json(path, CODEX_TAIL_BYTES):
         payload = event.get("payload")
         if not isinstance(payload, dict):
             continue
@@ -542,12 +1036,23 @@ def codex_state(rollout_path: str) -> tuple[str, int]:
         if event_type in status_events:
             state = status_events[event_type]
             state_at = parse_iso_ms(event.get("timestamp"))
+            note_step(step_times, state_at)
+        if event_type == "token_count":
+            info = payload.get("info")
+            if isinstance(info, dict) and isinstance(info.get("last_token_usage"), dict):
+                token_info = info
 
+    usage = token_info.get("last_token_usage", {}) if token_info else {}
+    load = build_load(
+        usage.get("input_tokens"),
+        token_info.get("model_context_window") if token_info else None,
+        step_times,
+    )
     if signature is not None:
         if len(_rollout_cache) > 200:
             _rollout_cache.clear()
-        _rollout_cache[rollout_path] = (signature, (state, state_at))
-    return state, state_at
+        _rollout_cache[rollout_path] = (signature, (state, state_at, load))
+    return state, state_at, load
 
 
 def codex_status(rollout_path: str, current_ms: int | None = None) -> str:
@@ -560,7 +1065,13 @@ def satellite_name(source: str) -> str:
         parsed = json.loads(source)
         subagent = parsed.get("subagent", {})
         if isinstance(subagent, dict):
-            return str(next(iter(subagent.values()), "子代理"))
+            value = next(iter(subagent.values()), "子代理")
+            if isinstance(value, dict):
+                # thread_spawn children carry their identity inside the value.
+                nickname = str(value.get("agent_nickname") or "").strip()
+                path_name = Path(str(value.get("agent_path") or "")).name
+                return nickname or path_name or "子代理"
+            return str(value) or "子代理"
     except (json.JSONDecodeError, AttributeError, TypeError):
         pass
     return "子代理"
@@ -594,6 +1105,36 @@ def resolve_codex_db() -> tuple[Path | None, str]:
     if not candidates:
         return None, f"{CODEX_DIR} 及其 sqlite 子目录下没有 state_*.sqlite"
     return max(candidates, key=candidate_key), ""
+
+
+def codex_connect_ro(database: Path) -> sqlite3.Connection:
+    """只读打开 Codex state 库，带 immutable 兜底。
+
+    WAL 库在写端不在线且上次未干净收尾时，纯 mode=ro 打开会因无法创建
+    -shm 而报 unable to open database file（2026-08-18 ChatGPT 桌面端升级
+    中断写端时实测踩到）。此时写端必然离线，用 immutable=1 读是安全的；
+    写端一旦回来 -shm 重建，主路径自然恢复。
+    """
+    last_error: sqlite3.Error | None = None
+    for uri in (
+        f"file:{database}?mode=ro",
+        f"file:{database}?mode=ro&immutable=1",
+    ):
+        connection = None
+        try:
+            connection = sqlite3.connect(uri, uri=True)
+            connection.execute("SELECT 1").fetchone()
+            return connection
+        except sqlite3.Error as error:
+            last_error = error
+            if connection is not None:
+                try:
+                    connection.close()
+                except sqlite3.Error:
+                    pass
+    raise last_error if last_error else sqlite3.OperationalError(
+        "unable to open database file"
+    )
 
 
 def codex_table_columns(connection: sqlite3.Connection) -> set[str]:
@@ -658,7 +1199,7 @@ def codex_query(columns: set[str], locked_count: int) -> str:
         CASE
           WHEN COALESCE({raw_thread_source}, '') <> '' THEN {raw_thread_source}
           WHEN source LIKE '%"subagent"%' THEN 'subagent'
-          WHEN source = 'vscode' THEN 'user'
+          WHEN source IN ('vscode', 'exec') THEN 'user'
           ELSE ''
         END
     """
@@ -702,7 +1243,7 @@ def load_codex_threads(
 
     locked = tuple(sorted(locked_ids or ()))[:50]
     try:
-        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        connection = codex_connect_ro(database)
         connection.row_factory = sqlite3.Row
         columns = codex_table_columns(connection)
         issue = codex_schema_issue(columns)
@@ -728,7 +1269,7 @@ def load_codex_threads(
         source = str(row["source"] or "")
         thread_source = str(row["thread_source"] or "")
         rollout_path = str(row["rollout_path"] or "")
-        status, status_at = codex_state(rollout_path)
+        status, status_at, load = codex_state(rollout_path)
         cwd = str(row["cwd"] or "")
         label = clean_label(
             row["agent_nickname"] or row["name"] or row["title"] or "",
@@ -739,26 +1280,30 @@ def load_codex_threads(
         status = apply_stall(
             status, current_ms - quiet_since, current_ms - quiet_since
         )
+        completion_id = (
+            status_at or normalize_ms(row["activity_ms"])
+            if status == "completed"
+            else 0
+        )
+        if is_preexisting_completion(status, completion_id):
+            continue
         agent = {
             "id": str(row["id"]),
             "platform": "codex",
             "name": label,
             "status": status,
-            "detail": "Codex",
+            "detail": "Codex CLI" if source == "exec" else "Codex",
             "cwd": cwd,
             "cwdLabel": cwd_label(cwd),
             "updatedAt": normalize_ms(row["activity_ms"]),
             "quietSince": quiet_since,
-            "completionId": (
-                status_at or normalize_ms(row["activity_ms"])
-                if status == "completed"
-                else 0
-            ),
+            "completionId": completion_id,
             "openable": True,
+            "load": load,
             "satellites": [],
         }
         apply_completion_acknowledgement("codex", agent)
-        if thread_source == "user" and source == "vscode":
+        if thread_source == "user" and source in {"vscode", "exec"}:
             foreground.append(agent)
         elif thread_source == "subagent":
             agent["name"] = satellite_name(source)
@@ -792,37 +1337,1555 @@ def prune_tracking(live_keys: set[str]) -> None:
     """Sessions come and go; do not let the tracking dicts grow forever."""
     for key in [key for key in _activity if key not in live_keys]:
         _activity.pop(key, None)
-    live_sessions = {key.split(":", 1)[1] for key in live_keys if key.startswith("claude:")}
+    # 按每个已注册源的 completion_key 前缀剥出原生 id，不再只认 "claude:"。
+    live_sessions = {
+        key.split(":", 1)[1]
+        for spec in SOURCES
+        for key in live_keys
+        if key.startswith(f"{spec.key}:")
+    }
     for key in [key for key in _claude_transitions if key not in live_sessions]:
         _claude_transitions.pop(key, None)
     for key in [key for key in _transcript_paths if key not in live_sessions]:
         _transcript_paths.pop(key, None)
+    for key in [key for key in _claude_load_cache if key not in live_sessions]:
+        _claude_load_cache.pop(key, None)
+    for key in [key for key in _subagent_cache if key not in live_sessions]:
+        _subagent_cache.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# 历史埋点与费用估算
+#
+# 独立于 5 秒采样循环：一条 60 秒的 ingester 线程按字节偏移增量续读
+# Claude transcript / Codex rollout，把「时间戳 + 用量数字」落进 sqlite。
+# 绝不落任何对话内容。金额不落库，由端点按当前价格表现算。
+# ---------------------------------------------------------------------------
+
+
+def _mtok_to_per_token(value: Any) -> float | None:
+    try:
+        return float(value) / 1_000_000.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_claude_price(entry: Any) -> dict[str, float] | None:
+    if not isinstance(entry, dict):
+        return None
+    normalized: dict[str, float] = {}
+    for field in ("input", "output", "cache_read", "cache_write"):
+        try:
+            normalized[field] = float(entry.get(field) or 0.0)
+        except (TypeError, ValueError):
+            return None
+    return normalized if any(normalized.values()) else None
+
+
+def _load_json_cached(path: Path) -> Any:
+    """mtime 缓存的 JSON 读取；失败返回 None。"""
+    key = str(path)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        _price_cache.pop(key, None)
+        return None
+    cached = _price_cache.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    _price_cache[key] = (mtime, parsed)
+    return parsed
+
+
+def claude_fallback_prices() -> dict[str, dict[str, float]]:
+    table: dict[str, dict[str, float]] = {}
+    for model, (inp, out, cache_read, cache_write) in (
+        CLAUDE_FALLBACK_PRICES_MTOK.items()
+    ):
+        table[model] = {
+            "input": inp / 1_000_000.0,
+            "output": out / 1_000_000.0,
+            "cache_read": cache_read / 1_000_000.0,
+            "cache_write": cache_write / 1_000_000.0,
+        }
+    return table
+
+
+def load_claude_prices(
+    path: Path | None = None,
+) -> tuple[dict[str, dict[str, float]], str]:
+    """返回 (模型→每 token 价格, 来源)。来源 live=价格镜像，fallback=兜底表。"""
+    parsed = _load_json_cached(path or CLAUDE_PRICES_PATH)
+    table: dict[str, dict[str, float]] = {}
+    if isinstance(parsed, dict):
+        for model, entry in parsed.items():
+            normalized = _normalize_claude_price(entry)
+            if normalized is not None and str(model).startswith("claude-"):
+                table[str(model)] = normalized
+    if table:
+        return table, "live"
+    return claude_fallback_prices(), "fallback"
+
+
+def ensure_codex_price_file(path: Path | None = None) -> None:
+    """缺失才播种，绝不覆盖用户编辑过的文件。"""
+    path = path or CODEX_PRICES_PATH
+    if path.exists():
+        return
+    payload = json.dumps(CODEX_SEED_PRICES, ensure_ascii=False, indent=2)
+    temporary = path.with_name(f"{path.name}.tmp")
+    try:
+        temporary.write_text(payload, encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        return
+
+
+def load_codex_prices(
+    path: Path | None = None,
+) -> tuple[dict[str, dict[str, float]], str]:
+    """返回 (模型→每 token 价格, 来源)。来源 file=价格文件，seed=内存播种值。"""
+    parsed = _load_json_cached(path or CODEX_PRICES_PATH)
+    source = "file"
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("models"), dict):
+        parsed = CODEX_SEED_PRICES
+        source = "seed"
+    table: dict[str, dict[str, float]] = {}
+    for model, entry in parsed.get("models", {}).items():
+        if not isinstance(entry, dict):
+            continue
+        normalized: dict[str, float] = {}
+        broken = False
+        for field in ("input", "cached_input", "output"):
+            value = _mtok_to_per_token(entry.get(field))
+            if value is None:
+                broken = True
+                break
+            normalized[field] = value
+        if not broken:
+            table[str(model)] = normalized
+    return table, source
+
+
+def match_price(
+    model: Any, table: dict[str, dict[str, float]]
+) -> dict[str, float] | None:
+    """精确命中优先，其次最长前缀；无命中返回 None（金额显示 —）。"""
+    name = str(model or "")
+    if not name or name == "<synthetic>":
+        return None
+    if name in table:
+        return table[name]
+    best_key = ""
+    for key in table:
+        if name.startswith(key) and len(key) > len(best_key):
+            best_key = key
+    return table.get(best_key) if best_key else None
+
+
+def _all_none(tokens: dict[str, Any], fields: tuple[str, ...]) -> bool:
+    return all(tokens.get(field) is None for field in fields)
+
+
+def claude_cost_microusd(
+    tokens: dict[str, Any], price: dict[str, float] | None
+) -> int | None:
+    """四类 token 分开计价；1h 缓存写入是 2× input（prices.json 只给 5m 档）。"""
+    if price is None or _all_none(
+        tokens,
+        ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h"),
+    ):
+        return None
+
+    def count(field: str) -> int:
+        return int(tokens.get(field) or 0)
+
+    usd = (
+        count("input") * price["input"]
+        + count("output") * price["output"]
+        + count("cache_read") * price["cache_read"]
+        + count("cache_write_5m") * price["cache_write"]
+        + count("cache_write_1h") * price["input"] * 2.0
+    )
+    return int(round(usd * 1_000_000))
+
+
+def codex_cost_microusd(
+    tokens: dict[str, Any], price: dict[str, float] | None
+) -> int | None:
+    """OpenAI 口径：input 已包含 cached，须先减；reasoning 已在 output 内。"""
+    if price is None or _all_none(tokens, ("input", "output")):
+        return None
+    input_tokens = int(tokens.get("input") or 0)
+    cached = min(int(tokens.get("cached_input") or 0), input_tokens)
+    output_tokens = int(tokens.get("output") or 0)
+    usd = (
+        (input_tokens - cached) * price["input"]
+        + cached * price["cached_input"]
+        + output_tokens * price["output"]
+    )
+    return int(round(usd * 1_000_000))
+
+
+TURN_TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_5m_tokens",
+    "cache_write_1h_tokens",
+    "cached_input_tokens",
+    "reasoning_output_tokens",
+)
+
+
+def history_connect(
+    db_path: Path | None = None, readonly: bool = False
+) -> sqlite3.Connection:
+    path = db_path or HISTORY_DB_PATH
+    if readonly:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    else:
+        connection = sqlite3.connect(str(path), timeout=15)
+        connection.execute("PRAGMA journal_mode=WAL")
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def history_init(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ingest_files (
+          path TEXT PRIMARY KEY,
+          session_key TEXT NOT NULL,
+          byte_offset INTEGER NOT NULL DEFAULT 0,
+          file_size INTEGER NOT NULL DEFAULT 0,
+          cursor_json TEXT NOT NULL DEFAULT '{}',
+          last_ingested_at_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+          session_key TEXT PRIMARY KEY,
+          platform TEXT NOT NULL,
+          native_id TEXT NOT NULL,
+          parent_session_key TEXT,
+          name TEXT,
+          cwd_label TEXT,
+          model TEXT,
+          models_json TEXT NOT NULL DEFAULT '[]',
+          reasoning_effort TEXT,
+          started_at_ms INTEGER,
+          last_active_at_ms INTEGER,
+          ended_at_ms INTEGER,
+          last_status TEXT,
+          turn_count INTEGER NOT NULL DEFAULT 0,
+          input_tokens INTEGER,
+          output_tokens INTEGER,
+          cache_read_tokens INTEGER,
+          cache_write_5m_tokens INTEGER,
+          cache_write_1h_tokens INTEGER,
+          cached_input_tokens INTEGER,
+          reasoning_output_tokens INTEGER,
+          total_tokens INTEGER,
+          context_peak_tokens INTEGER,
+          context_window INTEGER,
+          context_peak_pct INTEGER,
+          updated_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_active
+          ON sessions(last_active_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_sessions_parent
+          ON sessions(parent_session_key);
+        CREATE TABLE IF NOT EXISTS turns (
+          session_key TEXT NOT NULL,
+          turn_key TEXT NOT NULL,
+          started_at_ms INTEGER,
+          ended_at_ms INTEGER,
+          model TEXT,
+          reasoning_effort TEXT,
+          input_tokens INTEGER,
+          output_tokens INTEGER,
+          cache_read_tokens INTEGER,
+          cache_write_5m_tokens INTEGER,
+          cache_write_1h_tokens INTEGER,
+          cached_input_tokens INTEGER,
+          reasoning_output_tokens INTEGER,
+          context_tokens INTEGER,
+          PRIMARY KEY (session_key, turn_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_turns_time
+          ON turns(session_key, started_at_ms);
+        """
+    )
+    connection.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+        (str(HISTORY_SCHEMA_VERSION),),
+    )
+    connection.commit()
+
+
+def upsert_session_meta(
+    connection: sqlite3.Connection,
+    session_key: str,
+    platform: str,
+    native_id: str,
+    **fields: Any,
+) -> None:
+    """只用新观测到的非空值覆盖；NULL 永远不冲掉已知事实。"""
+    known = {
+        "parent_session_key",
+        "name",
+        "cwd_label",
+        "model",
+        "reasoning_effort",
+        "started_at_ms",
+        "last_active_at_ms",
+        "last_status",
+        "context_window",
+        "total_tokens",
+    }
+    payload = {
+        key: value
+        for key, value in fields.items()
+        if key in known and value is not None
+    }
+    columns = ["session_key", "platform", "native_id", "updated_at_ms"]
+    values: list[Any] = [session_key, platform, native_id, now_ms()]
+    updates = ["updated_at_ms=excluded.updated_at_ms"]
+    for key, value in payload.items():
+        columns.append(key)
+        values.append(value)
+        if key == "total_tokens":
+            # threads 表的 tokens_used 只当兜底：轮级明细一旦存在以明细为准。
+            updates.append(
+                "total_tokens=COALESCE(sessions.total_tokens, excluded.total_tokens)"
+            )
+        elif key == "started_at_ms":
+            updates.append(
+                "started_at_ms=COALESCE(excluded.started_at_ms, sessions.started_at_ms)"
+            )
+        else:
+            updates.append(f"{key}=COALESCE(excluded.{key}, sessions.{key})")
+    connection.execute(
+        f"""
+        INSERT INTO sessions ({', '.join(columns)})
+        VALUES ({', '.join('?' for _ in columns)})
+        ON CONFLICT(session_key) DO UPDATE SET {', '.join(updates)}
+        """,
+        values,
+    )
+
+
+def note_session_model(
+    connection: sqlite3.Connection, session_key: str, model: str
+) -> None:
+    row = connection.execute(
+        "SELECT models_json FROM sessions WHERE session_key=?", (session_key,)
+    ).fetchone()
+    if row is None:
+        return
+    try:
+        models = json.loads(row["models_json"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        models = []
+    if not isinstance(models, list):
+        models = []
+    if model not in models:
+        models.append(model)
+        connection.execute(
+            "UPDATE sessions SET models_json=?, model=? WHERE session_key=?",
+            (json.dumps(models, ensure_ascii=False), model, session_key),
+        )
+    else:
+        connection.execute(
+            "UPDATE sessions SET model=? WHERE session_key=?",
+            (model, session_key),
+        )
+
+
+def read_new_lines(
+    path: Path, offset: int, budget: int
+) -> tuple[list[bytes], int, bool]:
+    """从 offset 续读整行；尾部半行不消费。返回 (行, 新偏移, 是否被截断过)。"""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return [], offset, False
+    truncated = size < offset
+    if truncated:
+        offset = 0
+    if size <= offset or budget <= 0:
+        return [], offset, truncated
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            raw = handle.read(min(budget, size - offset))
+    except OSError:
+        return [], offset, truncated
+    end = raw.rfind(b"\n")
+    if end == -1:
+        return [], offset, truncated
+    return raw[:end].split(b"\n"), offset + end + 1, truncated
+
+
+def _line_json(raw: bytes) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def upsert_claude_turn(
+    connection: sqlite3.Connection,
+    session_key: str,
+    turn_key: str,
+    started_at_ms: int | None,
+    ended_at_ms: int | None,
+    model: str | None,
+    effort: str | None,
+    tokens: dict[str, Any],
+    context_tokens: int | None,
+) -> None:
+    """同一 requestId 的流式行重复累计用量，last-wins 整行替换。"""
+    connection.execute(
+        """
+        INSERT INTO turns (
+          session_key, turn_key, started_at_ms, ended_at_ms, model,
+          reasoning_effort, input_tokens, output_tokens, cache_read_tokens,
+          cache_write_5m_tokens, cache_write_1h_tokens, cached_input_tokens,
+          reasoning_output_tokens, context_tokens
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_key, turn_key) DO UPDATE SET
+          ended_at_ms=excluded.ended_at_ms,
+          model=COALESCE(excluded.model, turns.model),
+          reasoning_effort=COALESCE(excluded.reasoning_effort, turns.reasoning_effort),
+          input_tokens=excluded.input_tokens,
+          output_tokens=excluded.output_tokens,
+          cache_read_tokens=excluded.cache_read_tokens,
+          cache_write_5m_tokens=excluded.cache_write_5m_tokens,
+          cache_write_1h_tokens=excluded.cache_write_1h_tokens,
+          cached_input_tokens=excluded.cached_input_tokens,
+          reasoning_output_tokens=excluded.reasoning_output_tokens,
+          context_tokens=MAX(
+            COALESCE(turns.context_tokens, 0),
+            COALESCE(excluded.context_tokens, 0)
+          )
+        """,
+        (
+            session_key,
+            turn_key,
+            started_at_ms,
+            ended_at_ms,
+            model,
+            effort,
+            tokens.get("input_tokens"),
+            tokens.get("output_tokens"),
+            tokens.get("cache_read_tokens"),
+            tokens.get("cache_write_5m_tokens"),
+            tokens.get("cache_write_1h_tokens"),
+            tokens.get("cached_input_tokens"),
+            tokens.get("reasoning_output_tokens"),
+            context_tokens,
+        ),
+    )
+
+
+def ingest_claude_lines(
+    connection: sqlite3.Connection,
+    session_key: str,
+    lines: list[bytes],
+    cursor: dict[str, Any],
+) -> bool:
+    """只提取时间戳、模型、强度与用量数字；对话内容一个字都不进库。"""
+    touched = False
+    for raw in lines:
+        line = _line_json(raw)
+        if line is None:
+            continue
+        if not cursor.get("cwd_noted") and line.get("cwd"):
+            connection.execute(
+                "UPDATE sessions SET cwd_label=COALESCE(cwd_label, ?) "
+                "WHERE session_key=?",
+                (cwd_label(str(line["cwd"])), session_key),
+            )
+            cursor["cwd_noted"] = True
+        line_type = str(line.get("type") or "")
+        if line_type == "user":
+            stamp = parse_iso_ms(line.get("timestamp"))
+            if stamp:
+                cursor["last_user_ts"] = stamp
+            continue
+        if line_type != "assistant" or line.get("isSidechain") is True:
+            continue
+        message = line.get("message")
+        if not isinstance(message, dict):
+            continue
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        model = str(message.get("model") or "") or None
+        if model == "<synthetic>":
+            continue
+        stamp = parse_iso_ms(line.get("timestamp"))
+        request_id = str(line.get("requestId") or "") or (
+            f"ts{stamp}" if stamp else None
+        )
+        if request_id is None:
+            continue
+        effort = str(line.get("effort") or "") or None
+
+        cache_creation = usage.get("cache_creation")
+        write_5m = write_1h = None
+        if isinstance(cache_creation, dict):
+            write_5m = _as_int(cache_creation.get("ephemeral_5m_input_tokens"))
+            write_1h = _as_int(cache_creation.get("ephemeral_1h_input_tokens"))
+        if write_5m is None and write_1h is None:
+            write_5m = _as_int(usage.get("cache_creation_input_tokens"))
+        details = usage.get("output_tokens_details")
+        thinking = (
+            _as_int(details.get("thinking_tokens"))
+            if isinstance(details, dict)
+            else None
+        )
+        tokens = {
+            "input_tokens": _as_int(usage.get("input_tokens")),
+            "output_tokens": _as_int(usage.get("output_tokens")),
+            "cache_read_tokens": _as_int(usage.get("cache_read_input_tokens")),
+            "cache_write_5m_tokens": write_5m,
+            "cache_write_1h_tokens": write_1h,
+            "cached_input_tokens": None,
+            "reasoning_output_tokens": thinking,
+        }
+        context_tokens = (
+            (tokens["input_tokens"] or 0)
+            + (tokens["cache_read_tokens"] or 0)
+            + (write_5m or 0)
+            + (write_1h or 0)
+        ) or None
+
+        started = int(cursor.get("last_user_ts") or 0) or (stamp or None)
+        upsert_claude_turn(
+            connection,
+            session_key,
+            request_id,
+            started,
+            stamp or None,
+            model,
+            effort,
+            tokens,
+            context_tokens,
+        )
+        if model:
+            note_session_model(connection, session_key, model)
+        if effort:
+            connection.execute(
+                "UPDATE sessions SET reasoning_effort=? WHERE session_key=?",
+                (effort, session_key),
+            )
+        touched = True
+    return touched
+
+
+def ingest_codex_events(
+    connection: sqlite3.Connection,
+    session_key: str,
+    lines: list[bytes],
+    cursor: dict[str, Any],
+) -> bool:
+    """rollout 的 token_count 是累计值：相邻快照做差得每轮增量。"""
+    touched = False
+    for raw in lines:
+        event = _line_json(raw)
+        if event is None:
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        event_type = str(payload.get("type") or "")
+        stamp = parse_iso_ms(event.get("timestamp"))
+
+        if event_type == "task_started":
+            turn_key = f"t{stamp or now_ms()}"
+            cursor["open_turn"] = turn_key
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO turns (session_key, turn_key, started_at_ms)
+                VALUES (?, ?, ?)
+                """,
+                (session_key, turn_key, stamp or None),
+            )
+            touched = True
+            continue
+
+        if event_type in {"task_complete", "turn_aborted"}:
+            open_turn = cursor.pop("open_turn", None)
+            if open_turn and stamp:
+                connection.execute(
+                    "UPDATE turns SET ended_at_ms=? "
+                    "WHERE session_key=? AND turn_key=?",
+                    (stamp, session_key, open_turn),
+                )
+                touched = True
+            continue
+
+        if event_type != "token_count":
+            continue
+        info = payload.get("info")
+        if not isinstance(info, dict):
+            continue
+        totals = info.get("total_token_usage")
+        if not isinstance(totals, dict):
+            continue
+        window = _as_int(info.get("model_context_window"))
+        if window:
+            connection.execute(
+                "UPDATE sessions SET context_window=? WHERE session_key=?",
+                (window, session_key),
+            )
+        last_usage = info.get("last_token_usage")
+        context_tokens = (
+            _as_int(last_usage.get("input_tokens"))
+            if isinstance(last_usage, dict)
+            else None
+        )
+
+        current = {
+            field: _as_int(totals.get(field)) or 0
+            for field in (
+                "input_tokens",
+                "cached_input_tokens",
+                "cache_write_input_tokens",
+                "output_tokens",
+                "reasoning_output_tokens",
+            )
+        }
+        previous = cursor.get("last_totals")
+        if not isinstance(previous, dict):
+            # 新文件从 0 起：若该线程已有历史轮次（rollout 轮转/resume），
+            # 首个累计快照可能包含旧文件已计过的量——只立基线不记增量，
+            # 宁可少记一段也不双算。
+            if cursor.get("primed_skip_first"):
+                cursor["last_totals"] = current
+                cursor.pop("primed_skip_first", None)
+                if context_tokens is not None:
+                    _bump_codex_context(
+                        connection, session_key, cursor, context_tokens, stamp
+                    )
+                touched = True
+                continue
+            previous = {field: 0 for field in current}
+        deltas = {
+            field: current[field] - int(previous.get(field) or 0)
+            for field in current
+        }
+        if any(delta < 0 for delta in deltas.values()):
+            # 计数回退（同文件被复用重开）：以新值为基线，绝不写负数。
+            cursor["last_totals"] = current
+            continue
+        cursor["last_totals"] = current
+
+        open_turn = cursor.get("open_turn")
+        if not open_turn:
+            open_turn = f"t{stamp or now_ms()}"
+            cursor["open_turn"] = open_turn
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO turns (session_key, turn_key, started_at_ms)
+                VALUES (?, ?, ?)
+                """,
+                (session_key, open_turn, stamp or None),
+            )
+        connection.execute(
+            """
+            UPDATE turns SET
+              ended_at_ms=?,
+              input_tokens=COALESCE(input_tokens, 0) + ?,
+              cached_input_tokens=COALESCE(cached_input_tokens, 0) + ?,
+              cache_write_5m_tokens=COALESCE(cache_write_5m_tokens, 0) + ?,
+              output_tokens=COALESCE(output_tokens, 0) + ?,
+              reasoning_output_tokens=COALESCE(reasoning_output_tokens, 0) + ?,
+              context_tokens=MAX(COALESCE(context_tokens, 0), ?)
+            WHERE session_key=? AND turn_key=?
+            """,
+            (
+                stamp or None,
+                deltas["input_tokens"],
+                deltas["cached_input_tokens"],
+                deltas["cache_write_input_tokens"],
+                deltas["output_tokens"],
+                deltas["reasoning_output_tokens"],
+                context_tokens or 0,
+                session_key,
+                open_turn,
+            ),
+        )
+        touched = True
+    return touched
+
+
+def _bump_codex_context(
+    connection: sqlite3.Connection,
+    session_key: str,
+    cursor: dict[str, Any],
+    context_tokens: int,
+    stamp: int,
+) -> None:
+    open_turn = cursor.get("open_turn")
+    if not open_turn:
+        return
+    connection.execute(
+        """
+        UPDATE turns SET
+          ended_at_ms=COALESCE(?, ended_at_ms),
+          context_tokens=MAX(COALESCE(context_tokens, 0), ?)
+        WHERE session_key=? AND turn_key=?
+        """,
+        (stamp or None, context_tokens, session_key, open_turn),
+    )
+
+
+def recompute_session(connection: sqlite3.Connection, session_key: str) -> None:
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS turn_count,
+               SUM(input_tokens) AS input_tokens,
+               SUM(output_tokens) AS output_tokens,
+               SUM(cache_read_tokens) AS cache_read_tokens,
+               SUM(cache_write_5m_tokens) AS cache_write_5m_tokens,
+               SUM(cache_write_1h_tokens) AS cache_write_1h_tokens,
+               SUM(cached_input_tokens) AS cached_input_tokens,
+               SUM(reasoning_output_tokens) AS reasoning_output_tokens,
+               MAX(context_tokens) AS context_peak,
+               MIN(started_at_ms) AS first_started,
+               MAX(COALESCE(ended_at_ms, started_at_ms)) AS last_ended
+        FROM turns WHERE session_key=?
+        """,
+        (session_key,),
+    ).fetchone()
+    if row is None:
+        return
+    session = connection.execute(
+        "SELECT platform, context_window, total_tokens FROM sessions "
+        "WHERE session_key=?",
+        (session_key,),
+    ).fetchone()
+    if session is None:
+        return
+
+    token_parts = [
+        row["input_tokens"],
+        row["output_tokens"],
+        row["cache_read_tokens"],
+        row["cache_write_5m_tokens"],
+        row["cache_write_1h_tokens"],
+    ]
+    cost_mode = cost_mode_for(str(session["platform"]))
+    if cost_mode == "codex":
+        # OpenAI 口径 input 已含 cached，总量 = input + output。
+        token_parts = [row["input_tokens"], row["output_tokens"]]
+    known_parts = [part for part in token_parts if part is not None]
+    total = sum(known_parts) if known_parts else session["total_tokens"]
+
+    window = session["context_window"]
+    if cost_mode == "claude" and not window:
+        window = CLAUDE_CONTEXT_WINDOW if CLAUDE_CONTEXT_WINDOW > 0 else None
+    peak = row["context_peak"]
+    pct = None
+    if peak and window and 0 < peak <= window:
+        pct = int(round(peak * 100.0 / window))
+
+    if int(row["turn_count"] or 0) > 0:
+        connection.execute(
+            """
+            UPDATE sessions SET
+              turn_count=?, input_tokens=?, output_tokens=?,
+              cache_read_tokens=?, cache_write_5m_tokens=?,
+              cache_write_1h_tokens=?, cached_input_tokens=?,
+              reasoning_output_tokens=?, total_tokens=?,
+              context_peak_tokens=?, context_window=?, context_peak_pct=?,
+              started_at_ms=COALESCE(started_at_ms, ?),
+              last_active_at_ms=NULLIF(
+                MAX(COALESCE(last_active_at_ms, 0), COALESCE(?, 0)), 0
+              ),
+              updated_at_ms=?
+            WHERE session_key=?
+            """,
+            (
+                row["turn_count"],
+                row["input_tokens"],
+                row["output_tokens"],
+                row["cache_read_tokens"],
+                row["cache_write_5m_tokens"],
+                row["cache_write_1h_tokens"],
+                row["cached_input_tokens"],
+                row["reasoning_output_tokens"],
+                total,
+                peak,
+                window,
+                pct,
+                row["first_started"],
+                row["last_ended"],
+                now_ms(),
+                session_key,
+            ),
+        )
+
+
+def claude_history_targets() -> list[dict[str, Any]]:
+    """活跃会话 + 回填窗口内的 transcript + Task 子代理文件。"""
+    targets: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    live_meta: dict[str, dict[str, Any]] = {}
+
+    if CLAUDE_SESSIONS_DIR.exists():
+        for path in CLAUDE_SESSIONS_DIR.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            session_id = str(data.get("sessionId") or "")
+            if session_id:
+                live_meta[session_id] = data
+
+    cutoff = time.time() - HISTORY_BACKFILL_DAYS * 86_400
+    candidates: dict[str, Path] = {}
+    for session_id in live_meta:
+        path = transcript_path(session_id)
+        if path is not None:
+            candidates[session_id] = path
+    if CLAUDE_PROJECTS_DIR.exists():
+        for path in CLAUDE_PROJECTS_DIR.glob("*/*.jsonl"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    continue
+            except OSError:
+                continue
+            candidates.setdefault(path.stem, path)
+
+    for session_id, path in candidates.items():
+        if str(path) in seen_paths:
+            continue
+        seen_paths.add(str(path))
+        meta = live_meta.get(session_id, {})
+        session_key = f"claude:{session_id}"
+        cwd = str(meta.get("cwd") or "")
+        targets.append(
+            {
+                "path": path,
+                "session_key": session_key,
+                "platform": "claude",
+                "native_id": session_id,
+                "meta": {
+                    "name": str(meta.get("name") or "") or None,
+                    "cwd_label": cwd_label(cwd) if cwd else None,
+                    "started_at_ms": normalize_ms(meta.get("startedAt")) or None,
+                },
+            }
+        )
+        subagents_dir = path.parent / session_id / "subagents"
+        if not subagents_dir.is_dir():
+            continue
+        for agent_file in sorted(subagents_dir.glob("agent-*.jsonl")):
+            agent_stem = agent_file.stem
+            agent_name = None
+            meta_file = agent_file.with_name(f"{agent_stem}.meta.json")
+            try:
+                agent_meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                if isinstance(agent_meta, dict):
+                    agent_name = (
+                        str(
+                            agent_meta.get("agentType")
+                            or agent_meta.get("name")
+                            or ""
+                        )
+                        or None
+                    )
+            except (OSError, json.JSONDecodeError):
+                pass
+            targets.append(
+                {
+                    "path": agent_file,
+                    "session_key": f"{session_key}/{agent_stem}",
+                    "platform": "claude",
+                    "native_id": agent_stem,
+                    "meta": {
+                        "parent_session_key": session_key,
+                        "name": agent_name or agent_stem,
+                    },
+                }
+            )
+    return targets
+
+
+def codex_history_targets() -> list[dict[str, Any]]:
+    database, _detail = resolve_codex_db()
+    if database is None:
+        return []
+    try:
+        connection = codex_connect_ro(database)
+        connection.row_factory = sqlite3.Row
+        columns = codex_table_columns(connection)
+        if codex_schema_issue(columns):
+            connection.close()
+            return []
+        activity = codex_activity_expression(columns)
+        title = codex_text_expression(
+            columns, ("title", "first_user_message", "preview")
+        )
+        optional = {
+            name: (name if name in columns else "NULL")
+            for name in (
+                "agent_nickname",
+                "name",
+                "thread_source",
+                "model",
+                "reasoning_effort",
+                "tokens_used",
+            )
+        }
+        cutoff = now_ms() - HISTORY_BACKFILL_DAYS * 86_400_000
+        rows = list(
+            connection.execute(
+                f"""
+                SELECT id, cwd, source, rollout_path,
+                       {title} AS title,
+                       {optional['agent_nickname']} AS agent_nickname,
+                       {optional['name']} AS name,
+                       {optional['thread_source']} AS thread_source,
+                       {optional['model']} AS model,
+                       {optional['reasoning_effort']} AS reasoning_effort,
+                       {optional['tokens_used']} AS tokens_used,
+                       {activity} AS activity_ms
+                FROM threads
+                WHERE {activity} >= ?
+                ORDER BY activity_ms DESC
+                LIMIT 200
+                """,
+                (cutoff,),
+            )
+        )
+        connection.close()
+    except sqlite3.Error:
+        return []
+
+    user_by_cwd: dict[str, str] = {}
+    for row in rows:
+        source = str(row["source"] or "")
+        thread_source = str(row["thread_source"] or "")
+        if thread_source == "user" or (
+            not thread_source and source in {"vscode", "exec"}
+        ):
+            user_by_cwd.setdefault(str(row["cwd"] or ""), str(row["id"]))
+
+    targets: list[dict[str, Any]] = []
+    for row in rows:
+        thread_id = str(row["id"])
+        rollout = str(row["rollout_path"] or "")
+        if not rollout:
+            continue
+        cwd = str(row["cwd"] or "")
+        source = str(row["source"] or "")
+        thread_source = str(row["thread_source"] or "")
+        parent_key = None
+        label = clean_label(
+            row["agent_nickname"] or row["name"] or row["title"] or "",
+            fallback=cwd_label(cwd) if cwd else "Codex",
+        )
+        if thread_source == "subagent" or (
+            not thread_source and '"subagent"' in source
+        ):
+            label = satellite_name(source)
+            parent_id = user_by_cwd.get(cwd)
+            if parent_id and parent_id != thread_id:
+                parent_key = f"codex:{parent_id}"
+        targets.append(
+            {
+                "path": Path(rollout),
+                "session_key": f"codex:{thread_id}",
+                "platform": "codex",
+                "native_id": thread_id,
+                "meta": {
+                    "parent_session_key": parent_key,
+                    "name": label,
+                    "cwd_label": cwd_label(cwd) if cwd else None,
+                    "model": str(row["model"] or "") or None,
+                    "reasoning_effort": str(row["reasoning_effort"] or "") or None,
+                    "total_tokens": _as_int(row["tokens_used"]),
+                    "last_active_at_ms": normalize_ms(row["activity_ms"]) or None,
+                },
+            }
+        )
+    return targets
+
+
+def ingest_target(
+    connection: sqlite3.Connection, target: dict[str, Any], budget: int
+) -> tuple[int, bool]:
+    """续读单个文件；offset、cursor 与数据行同一事务提交。返回 (消费字节, 是否有新数据)。"""
+    path: Path = target["path"]
+    session_key: str = target["session_key"]
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0, False
+
+    state = connection.execute(
+        "SELECT byte_offset, file_size, cursor_json FROM ingest_files WHERE path=?",
+        (str(path),),
+    ).fetchone()
+    offset = int(state["byte_offset"]) if state else 0
+    if state and int(state["file_size"]) == size and offset >= size:
+        return 0, False
+    try:
+        cursor = json.loads(state["cursor_json"]) if state else {}
+    except (json.JSONDecodeError, TypeError):
+        cursor = {}
+    if not isinstance(cursor, dict):
+        cursor = {}
+
+    # 读哪种日志方言，跟着注册表登记的记账口径走。
+    dialect = cost_mode_for(str(target["platform"]))
+    if state is None and dialect == "codex":
+        prior = connection.execute(
+            "SELECT COUNT(*) FROM turns WHERE session_key=? "
+            "AND input_tokens IS NOT NULL",
+            (session_key,),
+        ).fetchone()
+        if prior and int(prior[0]) > 0:
+            cursor["primed_skip_first"] = True
+
+    lines, new_offset, truncated = read_new_lines(path, offset, budget)
+    if truncated:
+        cursor = {}
+    upsert_session_meta(
+        connection,
+        session_key,
+        target["platform"],
+        target["native_id"],
+        **target.get("meta", {}),
+    )
+    touched = False
+    if lines:
+        if dialect == "claude":
+            touched = ingest_claude_lines(connection, session_key, lines, cursor)
+        else:
+            touched = ingest_codex_events(connection, session_key, lines, cursor)
+    if touched:
+        recompute_session(connection, session_key)
+    connection.execute(
+        """
+        INSERT INTO ingest_files (
+          path, session_key, byte_offset, file_size, cursor_json,
+          last_ingested_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+          session_key=excluded.session_key,
+          byte_offset=excluded.byte_offset,
+          file_size=excluded.file_size,
+          cursor_json=excluded.cursor_json,
+          last_ingested_at_ms=excluded.last_ingested_at_ms
+        """,
+        (
+            str(path),
+            session_key,
+            new_offset,
+            size,
+            json.dumps(cursor, ensure_ascii=False),
+            now_ms(),
+        ),
+    )
+    connection.commit()
+    return max(0, new_offset - offset), touched
+
+
+def live_status_map(snap: dict[str, Any]) -> dict[str, str]:
+    """一份快照里所有主会话与卫星的 `platform:id → status`。"""
+    live: dict[str, str] = {}
+    for spec in SOURCES:
+        for agent in snap.get(spec.key, []):
+            live[completion_key(spec.key, agent["id"])] = str(
+                agent.get("status") or ""
+            )
+            for satellite in agent.get("satellites", []):
+                live[completion_key(spec.key, satellite["id"])] = str(
+                    satellite.get("status") or ""
+                )
+    return live
+
+
+def mark_ended_sessions(connection: sqlite3.Connection) -> None:
+    """用最近一次快照对账：从面板上消失的会话盖上结束时间。"""
+    with _snapshot_ready:
+        snap = _latest_snapshot
+    if snap is None:
+        return
+    live = live_status_map(snap)
+    rows = connection.execute(
+        "SELECT session_key, last_active_at_ms, ended_at_ms FROM sessions "
+        "WHERE parent_session_key IS NULL OR platform='codex'"
+    ).fetchall()
+    for row in rows:
+        key = str(row["session_key"])
+        if key in live:
+            connection.execute(
+                "UPDATE sessions SET last_status=?, ended_at_ms=NULL "
+                "WHERE session_key=?",
+                (live[key], key),
+            )
+        elif row["ended_at_ms"] is None and row["last_active_at_ms"]:
+            connection.execute(
+                "UPDATE sessions SET ended_at_ms=last_active_at_ms "
+                "WHERE session_key=?",
+                (key,),
+            )
+    connection.commit()
+
+
+def prune_history(connection: sqlite3.Connection) -> None:
+    current = now_ms()
+    connection.execute(
+        "DELETE FROM turns WHERE COALESCE(ended_at_ms, started_at_ms, 0) < ?",
+        (current - HISTORY_TURNS_RETENTION_DAYS * 86_400_000,),
+    )
+    connection.execute(
+        "DELETE FROM sessions WHERE COALESCE(last_active_at_ms, updated_at_ms) < ?",
+        (current - HISTORY_RETENTION_DAYS * 86_400_000,),
+    )
+    connection.execute(
+        "DELETE FROM ingest_files WHERE last_ingested_at_ms < ?",
+        (current - HISTORY_RETENTION_DAYS * 86_400_000,),
+    )
+    connection.commit()
+
+
+_history_pass_count = 0
+
+
+def history_pass(db_path: Path | None = None) -> None:
+    global _history_pass_count
+    connection = history_connect(db_path)
+    try:
+        history_init(connection)
+        targets: list[dict[str, Any]] = []
+        for spec in SOURCES:
+            targets.extend(spec.history_targets())
+
+        def target_mtime(target: dict[str, Any]) -> float:
+            try:
+                return target["path"].stat().st_mtime
+            except OSError:
+                return 0.0
+
+        targets.sort(key=target_mtime, reverse=True)
+        budget = HISTORY_INGEST_BYTE_BUDGET
+        for target in targets:
+            if budget <= 0:
+                break
+            consumed, _touched = ingest_target(connection, target, budget)
+            budget -= consumed
+        mark_ended_sessions(connection)
+        _history_pass_count += 1
+        if _history_pass_count % 60 == 1:
+            prune_history(connection)
+        _history_health.update(
+            {"state": "ok", "detail": "", "lastPassAtMs": now_ms()}
+        )
+    finally:
+        connection.close()
+
+
+def history_loop(stop: threading.Event) -> None:
+    ensure_codex_price_file()
+    while not stop.is_set():
+        try:
+            history_pass()
+        except Exception as error:  # noqa: BLE001 - 面板必须活过一次坏数据
+            _history_health.update({"state": "error", "detail": str(error)})
+        stop.wait(HISTORY_INTERVAL_MS / 1000)
+
+
+def _session_tokens(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "input": row["input_tokens"],
+        "output": row["output_tokens"],
+        "cache_read": row["cache_read_tokens"],
+        "cache_write_5m": row["cache_write_5m_tokens"],
+        "cache_write_1h": row["cache_write_1h_tokens"],
+        "cached_input": row["cached_input_tokens"],
+        "reasoning_output": row["reasoning_output_tokens"],
+        "total": row["total_tokens"],
+    }
+
+
+def _cost_for(
+    platform: str,
+    model: Any,
+    tokens: dict[str, Any],
+    claude_prices: dict[str, dict[str, float]],
+    codex_prices: dict[str, dict[str, float]],
+) -> int | None:
+    if cost_mode_for(platform) == "codex":
+        return codex_cost_microusd(
+            {
+                "input": tokens.get("input"),
+                "cached_input": tokens.get("cached_input"),
+                "output": tokens.get("output"),
+            },
+            match_price(model, codex_prices),
+        )
+    return claude_cost_microusd(
+        {
+            "input": tokens.get("input"),
+            "output": tokens.get("output"),
+            "cache_read": tokens.get("cache_read"),
+            "cache_write_5m": tokens.get("cache_write_5m"),
+            "cache_write_1h": tokens.get("cache_write_1h"),
+        },
+        match_price(model, claude_prices),
+    )
+
+
+def _live_status_map() -> dict[str, str]:
+    with _snapshot_ready:
+        snap = _latest_snapshot
+    return live_status_map(snap) if snap is not None else {}
+
+
+def _session_object(
+    row: sqlite3.Row,
+    live: dict[str, str],
+    claude_prices: dict[str, dict[str, float]],
+    codex_prices: dict[str, dict[str, float]],
+) -> dict[str, Any]:
+    platform = str(row["platform"])
+    spec = source_for(platform)
+    key = str(row["session_key"])
+    tokens = _session_tokens(row)
+    try:
+        models = json.loads(row["models_json"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        models = []
+    return {
+        "sessionKey": key,
+        "platform": platform,
+        "id": str(row["native_id"]),
+        "name": row["name"],
+        "cwdLabel": row["cwd_label"],
+        "model": row["model"],
+        "effort": row["reasoning_effort"],
+        "mixedModels": isinstance(models, list) and len(models) > 1,
+        "startedAtMs": row["started_at_ms"],
+        "lastActiveAtMs": row["last_active_at_ms"],
+        "endedAtMs": row["ended_at_ms"],
+        "live": key in live,
+        "status": live.get(key) or row["last_status"],
+        "turnCount": row["turn_count"],
+        "tokens": {
+            "input": tokens["input"],
+            "output": tokens["output"],
+            "cacheRead": tokens["cache_read"],
+            "cacheWrite5m": tokens["cache_write_5m"],
+            "cacheWrite1h": tokens["cache_write_1h"],
+            "cachedInput": tokens["cached_input"],
+            "reasoningOutput": tokens["reasoning_output"],
+            "total": tokens["total"],
+        },
+        "contextPeakTokens": row["context_peak_tokens"],
+        "contextWindow": row["context_window"],
+        "contextPeakPct": row["context_peak_pct"],
+        "costMicroUsd": _cost_for(
+            platform, row["model"], tokens, claude_prices, codex_prices
+        ),
+        "costLabel": spec.cost_label if spec is not None else "等效API标价",
+    }
+
+
+def history_summary_payload(days: int, limit: int) -> dict[str, Any]:
+    days = max(1, min(90, days))
+    limit = max(1, min(200, limit))
+    base: dict[str, Any] = {
+        "schemaVersion": HISTORY_SCHEMA_VERSION,
+        "generatedAt": now_ms(),
+        "state": "ok",
+        "detail": "",
+        "sessions": [],
+    }
+    claude_prices, claude_source = load_claude_prices()
+    codex_prices, codex_source = load_codex_prices()
+    base["pricing"] = {"claude": claude_source, "codex": codex_source}
+    if not HISTORY_DB_PATH.exists():
+        base["state"] = "initializing"
+        base["detail"] = str(_history_health.get("detail") or "正在建立历史库")
+        return base
+    if _history_health.get("state") == "error":
+        base["detail"] = str(_history_health.get("detail") or "")
+
+    try:
+        connection = history_connect(readonly=True)
+    except sqlite3.Error as error:
+        base["state"] = "initializing"
+        base["detail"] = str(error)
+        return base
+    try:
+        cutoff = now_ms() - days * 86_400_000
+        rows = connection.execute(
+            """
+            SELECT * FROM sessions
+            WHERE parent_session_key IS NULL
+              AND COALESCE(last_active_at_ms, updated_at_ms) >= ?
+            ORDER BY COALESCE(last_active_at_ms, updated_at_ms) DESC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        ).fetchall()
+        children = connection.execute(
+            "SELECT * FROM sessions WHERE parent_session_key IS NOT NULL"
+        ).fetchall()
+    except sqlite3.Error as error:
+        base["state"] = "initializing"
+        base["detail"] = str(error)
+        return base
+    finally:
+        connection.close()
+
+    child_map: dict[str, list[sqlite3.Row]] = {}
+    for child in children:
+        child_map.setdefault(str(child["parent_session_key"]), []).append(child)
+
+    live = _live_status_map()
+    sessions = []
+    for row in rows:
+        obj = _session_object(row, live, claude_prices, codex_prices)
+        related = child_map.get(str(row["session_key"]), [])
+        if related:
+            child_costs = [
+                _cost_for(
+                    str(child["platform"]),
+                    child["model"],
+                    _session_tokens(child),
+                    claude_prices,
+                    codex_prices,
+                )
+                for child in related
+            ]
+            known_costs = [cost for cost in child_costs if cost is not None]
+            child_tokens = [
+                child["total_tokens"]
+                for child in related
+                if child["total_tokens"] is not None
+            ]
+            obj["subagents"] = {
+                "count": len(related),
+                "totalTokens": sum(child_tokens) if child_tokens else None,
+                "costMicroUsd": sum(known_costs) if known_costs else None,
+            }
+        else:
+            obj["subagents"] = {"count": 0, "totalTokens": None, "costMicroUsd": None}
+        sessions.append(obj)
+    base["sessions"] = sessions
+    return base
+
+
+def history_session_payload(session_key: str, turns_limit: int) -> dict[str, Any]:
+    turns_limit = max(1, min(500, turns_limit))
+    claude_prices, _ = load_claude_prices()
+    codex_prices, _ = load_codex_prices()
+    if not HISTORY_DB_PATH.exists():
+        return {"error": "历史库尚未建立"}
+    try:
+        connection = history_connect(readonly=True)
+    except sqlite3.Error as error:
+        return {"error": str(error)}
+    try:
+        row = connection.execute(
+            "SELECT * FROM sessions WHERE session_key=?", (session_key,)
+        ).fetchone()
+        if row is None:
+            return {"error": "没有这个会话的记录"}
+        turn_rows = connection.execute(
+            """
+            SELECT * FROM turns WHERE session_key=?
+            ORDER BY COALESCE(started_at_ms, 0) DESC LIMIT ?
+            """,
+            (session_key, turns_limit),
+        ).fetchall()
+    except sqlite3.Error as error:
+        return {"error": str(error)}
+    finally:
+        connection.close()
+
+    live = _live_status_map()
+    payload = _session_object(row, live, claude_prices, codex_prices)
+    platform = str(row["platform"])
+    session_model = row["model"]
+    turns = []
+    for turn in turn_rows:
+        tokens = {
+            "input": turn["input_tokens"],
+            "output": turn["output_tokens"],
+            "cache_read": turn["cache_read_tokens"],
+            "cache_write_5m": turn["cache_write_5m_tokens"],
+            "cache_write_1h": turn["cache_write_1h_tokens"],
+            "cached_input": turn["cached_input_tokens"],
+            "reasoning_output": turn["reasoning_output_tokens"],
+        }
+        model = turn["model"] or session_model
+        turns.append(
+            {
+                "turnKey": str(turn["turn_key"]),
+                "startedAtMs": turn["started_at_ms"],
+                "endedAtMs": turn["ended_at_ms"],
+                "model": model,
+                "effort": turn["reasoning_effort"],
+                "tokens": {
+                    "input": tokens["input"],
+                    "output": tokens["output"],
+                    "cacheRead": tokens["cache_read"],
+                    "cacheWrite5m": tokens["cache_write_5m"],
+                    "cacheWrite1h": tokens["cache_write_1h"],
+                    "cachedInput": tokens["cached_input"],
+                    "reasoningOutput": tokens["reasoning_output"],
+                },
+                "contextTokens": turn["context_tokens"],
+                "costMicroUsd": _cost_for(
+                    platform, model, tokens, claude_prices, codex_prices
+                ),
+            }
+        )
+    payload["turns"] = turns
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# 数据源注册表
+#
+# 每个来源（本机 Claude Code、Codex Desktop，往后还有别的运行时）在这里登记
+# 一次：怎么采、怎么打开、历史埋点读哪些文件、计费口径、UI 有哪些开关。采集与
+# 分发一律遍历 SOURCES，不再让 ("claude", "codex") 这对字面量散落各处。
+#
+# 回调一律写成 lambda：注册表在模块加载时就建好，而 open_* 在它后面才定义；
+# 延迟到调用时才解析全局名字，也让测试里的 patch.object(server, ...) 继续生效。
+# ---------------------------------------------------------------------------
+
+# 一轮采样共享的输入：当前时刻、这一轮的 ps 表、客户端钉住的 id。
+SampleContext = dict[str, Any]
+
+
+@dataclass
+class SourceSpec:
+    """一个数据源身上所有随源而变的东西。"""
+
+    key: str
+    label: str
+    order: int
+    kind: str
+    load: Callable[[SampleContext], tuple[list[dict[str, Any]], dict[str, str]]]
+    open: Callable[[dict[str, Any]], None]
+    history_targets: Callable[[], list[dict[str, Any]]]
+    cost_mode: str
+    cost_label: str
+    dismissible: bool
+    lockable: bool
+    hint: str
+    empty_text: str
+
+
+claude_spec = SourceSpec(
+    key="claude",
+    label="Claude Code",
+    order=0,
+    kind="local",
+    load=lambda ctx: load_claude_sessions(ctx["current_ms"], ctx["table"]),
+    open=lambda agent: open_claude(agent),
+    history_targets=lambda: claude_history_targets(),
+    cost_mode="claude",
+    cost_label="等效API标价",
+    dismissible=False,
+    lockable=False,
+    hint="终端里的 Claude Code 会话",
+    empty_text="没有正在运行的 Claude 会话",
+)
+
+codex_spec = SourceSpec(
+    key="codex",
+    label="Codex",
+    order=1,
+    kind="local",
+    load=lambda ctx: load_codex_threads(ctx["current_ms"], ctx["locked_ids"]),
+    open=lambda agent: open_codex(agent),
+    history_targets=lambda: codex_history_targets(),
+    cost_mode="codex",
+    cost_label="估算",
+    dismissible=True,
+    lockable=True,
+    hint="Codex Desktop 的任务",
+    empty_text="没有正在运行的 Codex 任务",
+)
+
+# 按 order 排好序声明；载荷里的先后就是这里的先后。
+SOURCES: list[SourceSpec] = [claude_spec, codex_spec]
+
+
+def source_for(platform: str) -> SourceSpec | None:
+    return next((spec for spec in SOURCES if spec.key == platform), None)
+
+
+def cost_mode_for(platform: str) -> str:
+    """注册表登记的记账口径；没登记的平台按自己的 key 走老路径。"""
+    spec = source_for(platform)
+    return spec.cost_mode if spec is not None else platform
 
 
 def snapshot(locked_codex_ids: set[str] | None = None) -> dict[str, Any]:
     current_ms = now_ms()
-    table = scan_processes()
-    claude, claude_health = load_claude_sessions(current_ms, table)
-    codex, codex_health = load_codex_threads(current_ms, locked_codex_ids)
+    context: SampleContext = {
+        "current_ms": current_ms,
+        "table": scan_processes(),
+        "locked_ids": locked_codex_ids or set(),
+    }
+    agents: dict[str, list[dict[str, Any]]] = {}
+    sources: dict[str, dict[str, str]] = {}
+    for spec in SOURCES:
+        agents[spec.key], sources[spec.key] = spec.load(context)
+
     prune_tracking(
-        {completion_key("claude", agent["id"]) for agent in claude}
-        | {completion_key("codex", agent["id"]) for agent in codex}
+        {
+            completion_key(spec.key, agent["id"])
+            for spec in SOURCES
+            for agent in agents[spec.key]
+        }
     )
-    return {
+    counts: dict[str, int] = {spec.key: len(agents[spec.key]) for spec in SOURCES}
+    counts["satellites"] = sum(
+        len(agent["satellites"])
+        for spec in SOURCES
+        for agent in agents[spec.key]
+    )
+    payload: dict[str, Any] = {
         "schemaVersion": SCHEMA_VERSION,
         "generatedAt": current_ms,
-        "sources": {"claude": claude_health, "codex": codex_health},
+        "sources": sources,
         "notifications": dict(_notify_health),
-        "claude": claude,
-        "codex": codex,
-        "counts": {
-            "claude": len(claude),
-            "codex": len(codex),
-            "satellites": sum(
-                len(agent["satellites"]) for agent in [*claude, *codex]
-            ),
-        },
     }
+    payload.update(agents)
+    payload["counts"] = counts
+    return payload
 
 
 def snapshot_revision(payload: dict[str, Any]) -> str:
@@ -869,9 +2932,9 @@ def dispatch_notifications(payload: dict[str, Any]) -> list[str]:
     global _notify_primed
     current_ms = int(payload.get("generatedAt") or now_ms())
     agents = [
-        (platform, agent)
-        for platform in ("claude", "codex")
-        for agent in payload.get(platform, [])
+        (spec.key, agent)
+        for spec in SOURCES
+        for agent in payload.get(spec.key, [])
     ]
     interesting = [
         (platform, agent)
@@ -1009,8 +3072,8 @@ def terminal_tty(pid: int) -> str:
     return tty if tty.startswith("/dev/") else f"/dev/{tty}"
 
 
-def open_claude(agent: dict[str, Any]) -> None:
-    tty = terminal_tty(int(agent["pid"]))
+def open_terminal_tab(pid: int) -> None:
+    tty = terminal_tty(pid)
     script = """
 on run argv
   set targetTTY to item 1 of argv
@@ -1066,6 +3129,26 @@ end run
         raise RuntimeError("已找到 Terminal 标签页，但未能切换到前台")
 
 
+def open_desktop_app() -> None:
+    result = subprocess.run(
+        ["open", "-a", "Claude"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "无法打开 Claude 桌面 App")
+
+
+def open_claude(agent: dict[str, Any]) -> None:
+    """按灯自己带的 openVia 分派：终端标签页，还是桌面 App。"""
+    if str(agent.get("openVia") or "tty") == "app:Claude":
+        open_desktop_app()
+        return
+    open_terminal_tab(int(agent["pid"]))
+
+
 def open_codex(agent: dict[str, Any]) -> None:
     result = subprocess.run(
         ["open", f"codex://threads/{agent['id']}"],
@@ -1079,7 +3162,11 @@ def open_codex(agent: dict[str, Any]) -> None:
 
 
 def find_agent(platform: str, agent_id: str) -> dict[str, Any] | None:
-    locked = {agent_id} if platform == "codex" else None
+    spec = source_for(platform)
+    if spec is None:
+        return None
+    # 可锁定的源要把这一条钉住，否则它可能刚好在这一轮被隐藏掉。
+    locked = {agent_id} if spec.lockable else None
     agents = snapshot(locked).get(platform, [])
     return next((item for item in agents if item["id"] == agent_id), None)
 
@@ -1155,7 +3242,37 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_agents(parse_qs(parsed.query))
             return
         if path == "/health":
-            self.send_json({"ok": True})
+            self.send_json(
+                {
+                    "ok": True,
+                    "version": APP_VERSION,
+                    "schemaVersion": SCHEMA_VERSION,
+                    "platforms": [spec.key for spec in SOURCES],
+                    "pid": os.getpid(),
+                }
+            )
+            return
+        if path == "/api/history":
+            query = parse_qs(parsed.query)
+            try:
+                days = int(query.get("days", ["7"])[0])
+            except ValueError:
+                days = 7
+            try:
+                limit = int(query.get("limit", ["50"])[0])
+            except ValueError:
+                limit = 50
+            self.send_json(history_summary_payload(days, limit))
+            return
+        if path == "/api/history/session":
+            query = parse_qs(parsed.query)
+            key = str(query.get("key", [""])[0])
+            try:
+                turns = int(query.get("turns", ["200"])[0])
+            except ValueError:
+                turns = 200
+            payload = history_session_payload(key, turns)
+            self.send_json(payload, 404 if payload.get("error") else 200)
             return
         if path in self.static_files:
             filename, content_type = self.static_files[path]
@@ -1181,22 +3298,30 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "请求格式错误"}, 400)
             return
 
-        if platform not in {"claude", "codex"}:
+        spec = source_for(platform)
+        if spec is None:
             self.send_json({"error": "未知平台"}, 400)
             return
         agent = find_agent(platform, agent_id)
-        if not agent or not agent.get("openable"):
-            self.send_json({"error": "会话已经离线或不可打开"}, 404)
+        if not agent:
+            self.send_json({"error": "会话已经离线"}, 404)
             return
-        try:
-            open_claude(agent) if platform == "claude" else open_codex(agent)
-        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-            self.send_json({"error": str(error)}, 500)
-            return
+        opened = False
+        if agent.get("openable"):
+            try:
+                spec.open(agent)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                self.send_json({"error": str(error)}, 500)
+                return
+            opened = True
+        # 打不开的灯（headless 的 `claude -p` 就是）也要能被确认掉，
+        # 否则它一转绿就再没有任何办法消掉。
         acknowledged = acknowledge_agent(agent)
         if acknowledged:
             refresh_snapshot()
-        self.send_json({"ok": True, "acknowledged": acknowledged})
+        self.send_json(
+            {"ok": True, "opened": opened, "acknowledged": acknowledged}
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1212,6 +3337,9 @@ def main() -> None:
     stop = threading.Event()
     sampler = threading.Thread(target=sampler_loop, args=(stop,), daemon=True)
     sampler.start()
+    if HISTORY_ENABLED:
+        history = threading.Thread(target=history_loop, args=(stop,), daemon=True)
+        history.start()
     print(f"Agent 状态呼吸灯已启动: http://127.0.0.1:{args.port}", flush=True)
     print("iPad 请访问 Mac 的局域网 IP，并使用相同端口。按 Ctrl+C 停止。", flush=True)
     try:

@@ -44,10 +44,31 @@
             aria-label="切换到亮色模式"
             title="切换到亮色模式"
           >☀︎</button>
+          <button
+            class="theme-toggle history-toggle"
+            id="historyToggle"
+            type="button"
+            aria-expanded="false"
+            aria-controls="historyPanel"
+            aria-label="费用与历史"
+            title="费用与历史"
+          >¢</button>
         </div>
       </header>
 
       <div class="banner" id="banner" role="alert" hidden></div>
+
+      <section class="history-panel" id="historyPanel" hidden aria-label="费用与历史">
+        <div class="history-heading">
+          <div>
+            <p class="platform-index">$</p>
+            <h2>费用与历史</h2>
+          </div>
+          <p class="history-note">Claude 为等效 API 标价 · Codex 为估算 · 只记时间与用量，不含内容</p>
+        </div>
+        <div class="history-live" id="historyLive"></div>
+        <div class="history-list" id="historyList"></div>
+      </section>
 
       <section class="sources" id="sources" aria-label="数据源状态"></section>
 
