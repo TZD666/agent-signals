@@ -56,7 +56,9 @@
 ./deploy.sh
 ```
 
-四步固定顺序：跑测试（用 launchd 里那个 `/usr/bin/python3`）→ 拷 `server.py` 与 `static/*` 到运行目录 → `launchctl kickstart -k` 重启服务 → 轮询 `/health` 直到 `version` 与 `server.py` 里的 `APP_VERSION` 对上（20 秒超时，超时会打印 `agent-signals.err.log` 末尾并非零退出）。测试不过就一个文件都不拷。
+四步固定顺序：跑测试（用 launchd 里那个 `/usr/bin/python3`）→ 拷 `server.py` 与 `static/*` 到运行目录（`discovery.py`、`cloud.py` 存在才拷，它们是后续阶段才出现的模块）→ `launchctl kickstart -k` 重启服务 → 轮询 `/health` 直到 `version` 与 `server.py` 里的 `APP_VERSION` 对上、**并且** `pid` 与重启前不同（20 秒超时，超时会打印 `agent-signals.err.log` 末尾并非零退出）。测试不过就一个文件都不拷。
+
+比 pid 是必要的：`APP_VERSION` 在同一阶段内是不变的手写常量，只比版本号的话，端口被别的野进程占着、新进程根本没起来时，老进程会用同一个版本号把健康检查骗过去。
 
 `agent-history.db`、`codex_prices.json`、`.agent-signals-state.json`、`runtime-profiles.json` 是运行时数据，脚本永远不覆盖它们。运行目录默认 `~/Library/Application Support/AgentSignals`，可用 `AGENT_SIGNALS_DEPLOY_DIR` 覆盖。
 

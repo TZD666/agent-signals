@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # 把仓库里的代码部署到 launchd 的运行目录。
-# 顺序固定：跑测试 → 拷文件 → kickstart → 轮询 /health 直到版本对上。
-# 任何一步不过就停下并非零退出，绝不留下"拷了一半"的运行目录。
+# 顺序固定：跑测试 → 拷文件 → kickstart → 轮询 /health 直到版本对上且换了进程。
+# 任何一步不过就停下并非零退出；测试不过就一个文件都不拷。
 #
 # 运行目录默认 ~/Library/Application Support/AgentSignals，
 # 可用 AGENT_SIGNALS_DEPLOY_DIR 覆盖（改端口用 AGENT_SIGNALS_PORT）。
@@ -39,6 +39,14 @@ is_protected() {
     fi
   done
   return 1
+}
+
+# 一次 curl 取回 "<version> <pid>"；服务不可达时是空串。
+read_health() {
+  curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null \
+    | "$PYTHON" -c \
+      'import json,sys; d=json.load(sys.stdin); print(d.get("version",""), d.get("pid",""))' \
+      2>/dev/null || true
 }
 
 install_file() {
@@ -79,27 +87,45 @@ for asset in static/*; do
   fi
 done
 
+# APP_VERSION 是同一阶段内不变的手写常量，光比版本号认不出「服务压根没重启」：
+# 端口被别的野进程占着时，老进程会用一模一样的版本号把健康检查骗过去。所以
+# kickstart 之前先记下当前的 pid，之后要求版本对上**并且**换了进程。
+old_pid="$(read_health | awk '{print $2}')"
+if [[ -n "$old_pid" ]]; then
+  printf '当前在跑的 pid：%s\n' "$old_pid"
+else
+  printf '当前没有进程应答 /health（首次部署，或服务已停）\n'
+fi
+
 printf '[3/4] 重启 %s\n' "$LABEL"
 launchctl kickstart -k "gui/$(id -u)/$LABEL" || die "launchctl kickstart 没成功"
 
-printf '[4/4] 等 /health 报出 %s（最多 %ss）\n' "$APP_VERSION" "$HEALTH_TIMEOUT_S"
-reported=""
+printf '[4/4] 等 /health 报出 %s 且换掉 pid %s（最多 %ss）\n' \
+  "$APP_VERSION" "${old_pid:-（无）}" "$HEALTH_TIMEOUT_S"
+reported_version=""
+reported_pid=""
 deadline=$(( SECONDS + HEALTH_TIMEOUT_S ))
 while (( SECONDS < deadline )); do
-  reported="$(
-    curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null \
-      | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' \
-        2>/dev/null || true
-  )"
-  if [[ "$reported" == "$APP_VERSION" ]]; then
-    printf '部署完成：%s 正在 %s 端口跑 %s\n' "$LABEL" "$PORT" "$APP_VERSION"
+  health="$(read_health)"
+  reported_version="$(printf '%s' "$health" | awk '{print $1}')"
+  reported_pid="$(printf '%s' "$health" | awk '{print $2}')"
+  if [[ "$reported_version" == "$APP_VERSION" && -n "$reported_pid" \
+        && "$reported_pid" != "$old_pid" ]]; then
+    printf '部署完成：%s 正在 %s 端口跑 %s（pid %s）\n' \
+      "$LABEL" "$PORT" "$APP_VERSION" "$reported_pid"
     exit 0
   fi
   sleep 0.5
 done
 
-printf '超时：%ss 内 /health 没报出 %s（最后读到 "%s"）\n' \
-  "$HEALTH_TIMEOUT_S" "$APP_VERSION" "$reported" >&2
+if [[ "$reported_version" == "$APP_VERSION" && "$reported_pid" == "$old_pid" \
+      && -n "$old_pid" ]]; then
+  printf '超时：%ss 内 pid 一直是 %s，服务没有被换掉——端口很可能被别的进程占着，新进程起不来\n' \
+    "$HEALTH_TIMEOUT_S" "$old_pid" >&2
+else
+  printf '超时：%ss 内 /health 没报出 %s（最后读到版本 "%s" / pid "%s"）\n' \
+    "$HEALTH_TIMEOUT_S" "$APP_VERSION" "$reported_version" "$reported_pid" >&2
+fi
 if [[ -f "$ERR_LOG" ]]; then
   printf -- '--- %s 末尾 40 行 ---\n' "$ERR_LOG" >&2
   tail -n 40 "$ERR_LOG" >&2
