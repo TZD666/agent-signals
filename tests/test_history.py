@@ -8,10 +8,12 @@ import importlib.util
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
@@ -22,6 +24,8 @@ SPEC = importlib.util.spec_from_file_location(
     "agent_status_server_history", Path(__file__).parents[1] / "server.py"
 )
 server = importlib.util.module_from_spec(SPEC)
+# dataclasses 解析注解时要回查 sys.modules[__module__]，先登记再执行。
+sys.modules[SPEC.name] = server
 SPEC.loader.exec_module(server)
 
 SENTINEL = "SENTINEL_对话内容_MUST_NOT_BE_STORED"
@@ -49,6 +53,16 @@ def claude_line(timestamp, request_id, usage, model="claude-fable-5", **extra):
     }
     line.update(extra)
     return line
+
+
+def iso_minutes_ago(minutes):
+    """相对当前时刻的 UTC 时间戳。
+
+    `history_summary_payload(days=...)` 是按「现在往前 N 天」过滤的，写死的
+    日期迟早会滑出窗口，用例就会在某天突然变红。
+    """
+    moment = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def user_line(timestamp):
@@ -638,16 +652,18 @@ class CodexTargetSchemaTests(unittest.TestCase):
 
 class SubagentRollupTests(HistoryDbTestCase):
     def test_child_sessions_roll_up_into_parent_payload(self):
+        parent_at = iso_minutes_ago(5)
+        child_at = iso_minutes_ago(4)
         parent = self.root / "parent.jsonl"
         write_jsonl(
             parent,
-            [claude_line("2026-08-18T10:00:05.000Z", "r1",
+            [claude_line(parent_at, "r1",
                          {"input_tokens": 10, "output_tokens": 20})],
         )
         child = self.root / "agent-abc.jsonl"
         write_jsonl(
             child,
-            [claude_line("2026-08-18T10:01:00.000Z", "r-child",
+            [claude_line(child_at, "r-child",
                          {"input_tokens": 100, "output_tokens": 200},
                          isSidechain=True)],
         )
@@ -659,7 +675,7 @@ class SubagentRollupTests(HistoryDbTestCase):
         # sidechain 行已在上一个用例验证被跳过。）
         write_jsonl(
             child,
-            [claude_line("2026-08-18T10:01:00.000Z", "r-child",
+            [claude_line(child_at, "r-child",
                          {"input_tokens": 100, "output_tokens": 200})],
         )
         server.ingest_target(
