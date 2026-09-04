@@ -503,6 +503,24 @@ class TerminalOpenTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "未能切换到前台"):
                 server.open_claude({"pid": 123})
 
+    def test_open_claude_sends_desktop_sessions_to_the_app(self):
+        result = Mock(returncode=0, stdout="", stderr="")
+        with patch.object(server, "terminal_tty") as tty, patch.object(
+            server.subprocess, "run", return_value=result
+        ) as run:
+            server.open_claude({"pid": 123, "openVia": "app:Claude"})
+        # 桌面 App 会话没有 Terminal 标签页可切，绝不能去查 tty。
+        tty.assert_not_called()
+        self.assertEqual(run.call_args.args[0], ["open", "-a", "Claude"])
+
+    def test_open_claude_with_tty_open_via_still_uses_the_terminal(self):
+        result = Mock(returncode=0, stdout="ok\n", stderr="")
+        with patch.object(
+            server, "terminal_tty", return_value="/dev/ttys003"
+        ), patch.object(server.subprocess, "run", return_value=result) as run:
+            server.open_claude({"pid": 123, "openVia": "tty"})
+        self.assertEqual(run.call_args.args[0][0], "osascript")
+
 
 class SourceHealthTests(unittest.TestCase):
     def test_missing_database_reports_unavailable_not_empty(self):
@@ -888,6 +906,286 @@ class ProcessTableTests(unittest.TestCase):
         )
         # 只为缺失的 pid 付一次 ps 的钱。
         self.assertEqual(run.call_args[0][0][2], "202")
+
+
+CLAUDE_NOW = 2_000_000_000_000
+DESKTOP_COMMAND = (
+    "/Users/edy/Library/Application Support/Claude/claude-code/"
+    "2.0.76/claude.app/Contents/MacOS/claude --title 桌面"
+)
+
+
+def registry(pid, **extra):
+    """一条 ~/.claude/sessions/<pid>.json 的最小形状；传 None 表示这个键不存在。"""
+    data = {
+        "pid": pid,
+        "sessionId": f"s{pid}",
+        "cwd": "/tmp/project",
+        "kind": "interactive",
+        "status": "busy",
+        "updatedAt": CLAUDE_NOW,
+    }
+    for key, value in extra.items():
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
+    return data
+
+
+class ClaudeFamilyTests(unittest.TestCase):
+    """入口标签、桌面 App 索引、headless 会话、PPID 挂靠、Task 子代理卫星。"""
+
+    def setUp(self):
+        for cache in (
+            server._claude_transitions,
+            server._activity,
+            server._transcript_paths,
+            server._claude_load_cache,
+            server._subagent_cache,
+            server._desktop_index_cache,
+        ):
+            cache.clear()
+
+    def sample(self, root, sessions, commands=None, children=None, current=CLAUDE_NOW):
+        """登记表落盘 → 跑一轮 load_claude_sessions，全部目录都在临时目录里。"""
+        sessions_dir = root / "sessions"
+        sessions_dir.mkdir(exist_ok=True)
+        (root / "projects").mkdir(exist_ok=True)
+        for data in sessions:
+            (sessions_dir / f"{data['pid']}.json").write_text(
+                json.dumps(data), encoding="utf-8"
+            )
+        if commands is None:
+            commands = {int(data["pid"]): "claude --title x" for data in sessions}
+        table = dict(EMPTY_TABLE, commands=commands, children=children or {})
+        with patch.object(server, "CLAUDE_SESSIONS_DIR", sessions_dir), patch.object(
+            server, "CLAUDE_PROJECTS_DIR", root / "projects"
+        ), patch.object(
+            server, "CLAUDE_DESKTOP_SUPPORT_DIR", root / "desktop"
+        ), patch.object(server, "command_lines", return_value=commands):
+            return server.load_claude_sessions(current, table)
+
+    def desktop_entry(self, root, cli_session_id, title):
+        folder = root / "desktop" / "claude-code-sessions" / "acct" / "org"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"local_{cli_session_id}.json").write_text(
+            json.dumps(
+                {
+                    "sessionId": f"local_{cli_session_id}",
+                    "cliSessionId": cli_session_id,
+                    "cwd": "/tmp/project",
+                    "title": title,
+                    "titleSource": "generated",
+                    "lastActivityAt": CLAUDE_NOW,
+                    "isArchived": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def subagent_file(self, folder, stem, age_ms, meta):
+        jsonl = folder / f"{stem}.jsonl"
+        jsonl.write_text("{}\n", encoding="utf-8")
+        stamp = (CLAUDE_NOW - age_ms) / 1000.0
+        os.utime(jsonl, (stamp, stamp))
+        (folder / f"{stem}.meta.json").write_text(
+            "不是 json" if meta is None else json.dumps(meta), encoding="utf-8"
+        )
+
+    def test_entrypoint_detail_labels(self):
+        sessions = [
+            registry(100, entrypoint="cli"),
+            registry(101, entrypoint="claude-vscode"),
+            registry(102, entrypoint="mcp"),
+            registry(103, entrypoint="local_agent"),
+            registry(104, entrypoint="sdk-cli"),
+            registry(105),  # 老登记表没有这个字段
+            registry(106),  # 也没有，但命令行是桌面 App 自带的那个二进制
+            registry(107, entrypoint="remote-future"),
+        ]
+        commands = {data["pid"]: "claude --title x" for data in sessions}
+        commands[106] = DESKTOP_COMMAND
+        with tempfile.TemporaryDirectory() as directory:
+            agents, health = self.sample(Path(directory), sessions, commands)
+        self.assertEqual(health["state"], "live")
+        self.assertEqual(
+            {agent["pid"]: agent["detail"] for agent in agents},
+            {
+                100: "Terminal",
+                101: "VS Code",
+                102: "MCP",
+                103: "桌面 Cowork",
+                104: "claude -p 后台",
+                105: "Terminal",
+                106: "桌面 App",
+                107: "remote-future",  # 认不出的入口原样显示，不假装是终端
+            },
+        )
+        by_pid = {agent["pid"]: agent for agent in agents}
+        self.assertEqual(by_pid[100]["openVia"], "tty")
+        self.assertEqual(by_pid[106]["openVia"], "app:Claude")
+
+    def test_desktop_index_overrides_name_and_open_via(self):
+        sessions = [
+            registry(200, name="terminal-200", nameSource="derived"),
+            registry(201, name="我起的名字"),
+            registry(202, name="没进索引"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.desktop_entry(root, "s200", "重构对账脚本")
+            self.desktop_entry(root, "s201", "索引里的标题")
+            (
+                root
+                / "desktop"
+                / "claude-code-sessions"
+                / "acct"
+                / "org"
+                / "local_broken.json"
+            ).write_text("{坏文件", encoding="utf-8")
+            agents, _ = self.sample(root, sessions)
+        by_pid = {agent["pid"]: agent for agent in agents}
+        self.assertEqual(by_pid[200]["name"], "重构对账脚本")
+        self.assertEqual(by_pid[200]["detail"], "桌面 App")
+        self.assertEqual(by_pid[200]["openVia"], "app:Claude")
+        self.assertEqual(by_pid[200]["origin"], "registry")
+        # 自己起的名字不许被索引标题盖掉。
+        self.assertEqual(by_pid[201]["name"], "我起的名字")
+        self.assertEqual(by_pid[201]["detail"], "桌面 App")
+        # 索引里没有的会话一切照旧。
+        self.assertEqual(by_pid[202]["name"], "没进索引")
+        self.assertEqual(by_pid[202]["openVia"], "tty")
+
+    def test_headless_session_without_status_is_thinking_while_cpu_moves(self):
+        sessions = [
+            registry(
+                300,
+                status=None,
+                updatedAt=None,
+                startedAt=CLAUDE_NOW,
+                entrypoint="sdk-cli",
+            )
+        ]
+        statuses, openable = [], []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for offset, mtime in ((0, 1_000.0), (10_000, 1_005.0), (50_000, 1_005.0)):
+                with patch.object(server, "transcript_mtime", return_value=mtime):
+                    agents, _ = self.sample(
+                        root, sessions, current=CLAUDE_NOW + offset
+                    )
+                statuses.append(agents[0]["status"])
+                openable.append(agents[0]["openable"])
+        self.assertEqual(statuses, ["thinking", "thinking", "completed"])
+        self.assertEqual(openable, [False, False, False])
+        self.assertEqual(agents[0]["detail"], "claude -p 后台")
+        # 没有 statusUpdatedAt/updatedAt 时退回 startedAt，而不是 0。
+        self.assertEqual(agents[0]["updatedAt"], CLAUDE_NOW)
+
+    def test_background_session_attaches_to_ppid_ancestor(self):
+        sessions = [
+            registry(400, cwd="/tmp/host"),
+            registry(500, cwd="/tmp/elsewhere"),
+            registry(402, kind="bg", cwd="/tmp/elsewhere", name="后台构建"),
+            registry(
+                403,
+                entrypoint="sdk-cli",
+                status=None,
+                updatedAt=None,
+                startedAt=CLAUDE_NOW,
+                cwd="/tmp/host",
+                name="claude -p 巡检",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            agents, _ = self.sample(
+                Path(directory), sessions, children={400: [401], 401: [402, 403]}
+            )
+        by_pid = {agent["pid"]: agent for agent in agents}
+        self.assertEqual(sorted(by_pid), [400, 500])
+        # cwd 相同的 500 是老规则会挑中的宿主；PPID 链把它挂回真正的父会话。
+        self.assertEqual(by_pid[500]["satellites"], [])
+        self.assertEqual(
+            {
+                (item["id"], item["name"], item["origin"])
+                for item in by_pid[400]["satellites"]
+            },
+            {
+                ("s402", "后台构建", "registry"),
+                ("s403", "claude -p 巡检", "registry"),
+            },
+        )
+
+    def test_subagent_meta_becomes_satellite_and_lingers_then_drops(self):
+        sessions = [registry(600, sessionId="s600")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "projects" / "proj").mkdir(parents=True)
+            write_transcript(root / "projects" / "proj" / "s600.jsonl", [{"type": "x"}])
+            folder = root / "projects" / "proj" / "s600" / "subagents"
+            folder.mkdir(parents=True)
+            self.subagent_file(
+                folder, "agent-live", 0, {"agentType": "Explore", "description": "找入口"}
+            )
+            self.subagent_file(
+                folder, "agent-done", 120_000, {"agentType": "Plan", "description": "定方案"}
+            )
+            self.subagent_file(
+                folder, "agent-gone", 900_000, {"agentType": "Plan", "description": "上小时的"}
+            )
+            self.subagent_file(folder, "agent-bad", 0, None)
+            agents, _ = self.sample(root, sessions)
+        satellites = {item["id"]: item for item in agents[0]["satellites"]}
+        # 完成超过 SUBAGENT_LINGER_MS 的那个不再显示。
+        self.assertEqual(
+            sorted(satellites), ["agent-bad", "agent-done", "agent-live"]
+        )
+        self.assertEqual(satellites["agent-live"]["name"], "Explore · 找入口")
+        self.assertEqual(satellites["agent-live"]["status"], "thinking")
+        self.assertEqual(satellites["agent-live"]["completionId"], 0)
+        self.assertEqual(satellites["agent-live"]["origin"], "subagent")
+        self.assertEqual(satellites["agent-done"]["status"], "completed")
+        self.assertEqual(
+            satellites["agent-done"]["completionId"], CLAUDE_NOW - 120_000
+        )
+        # meta 读不出来就退回文件名，不编造名字。
+        self.assertEqual(satellites["agent-bad"]["name"], "agent-bad")
+
+    def test_satellites_still_carry_no_load(self):
+        sessions = [registry(700), registry(702, kind="bg", name="后台任务")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "projects" / "proj").mkdir(parents=True)
+            write_transcript(root / "projects" / "proj" / "s700.jsonl", [{"type": "x"}])
+            folder = root / "projects" / "proj" / "s700" / "subagents"
+            folder.mkdir(parents=True)
+            self.subagent_file(
+                folder, "agent-x", 0, {"agentType": "Explore", "description": "看一眼"}
+            )
+            agents, _ = self.sample(root, sessions, children={700: [702]})
+        self.assertEqual(len(agents), 1)
+        self.assertEqual(len(agents[0]["satellites"]), 2)
+        self.assertEqual(
+            {frozenset(item) for item in agents[0]["satellites"]},
+            {frozenset({"id", "name", "status", "completionId", "origin"})},
+        )
+
+    def test_claimed_pids_cover_registry_pids_and_their_children(self):
+        sessions = [registry(700), registry(800)]
+        table = dict(
+            EMPTY_TABLE, children={700: [701, 702], 702: [703], 900: [901]}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            sessions_dir = Path(directory) / "sessions"
+            sessions_dir.mkdir()
+            for data in sessions:
+                (sessions_dir / f"{data['pid']}.json").write_text(
+                    json.dumps(data), encoding="utf-8"
+                )
+            with patch.object(server, "CLAUDE_SESSIONS_DIR", sessions_dir):
+                claimed = server.claude_claimed_pids(table)
+        self.assertEqual(claimed, {700, 701, 702, 703, 800})
 
 
 GOLDEN_CLAUDE = [

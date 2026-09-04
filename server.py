@@ -33,7 +33,7 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 SCHEMA_VERSION = 1
 
 ROOT = Path(__file__).resolve().parent
@@ -43,6 +43,12 @@ CLAUDE_SESSIONS_DIR = Path(
 ).expanduser()
 CLAUDE_PROJECTS_DIR = Path(
     os.environ.get("CLAUDE_PROJECTS_DIR", "~/.claude/projects")
+).expanduser()
+CLAUDE_DESKTOP_SUPPORT_DIR = Path(
+    os.environ.get(
+        "CLAUDE_DESKTOP_SUPPORT_DIR",
+        Path.home() / "Library" / "Application Support" / "Claude",
+    )
 ).expanduser()
 CODEX_DIR = Path(os.environ.get("CODEX_DIR", "~/.codex")).expanduser()
 CODEX_DB_PATH = (
@@ -76,6 +82,17 @@ NOTIFY_THROTTLE_MS = env_int("AGENT_SIGNALS_NOTIFY_THROTTLE_MS", 60_000)
 NOTIFY_MAX_PER_MINUTE = env_int("AGENT_SIGNALS_NOTIFY_MAX_PER_MINUTE", 10)
 NOTIFY_ENABLED = os.environ.get("AGENT_SIGNALS_NOTIFY", "1") != "0"
 LOCKED_ID_TTL_MS = 10 * 60 * 1000
+
+# headless 的 `claude -p` 登记表不写 status，只能按「还有没有活动」自己判。
+CLAUDE_HEADLESS_ACTIVE_MS = env_int("AGENT_SIGNALS_CLAUDE_HEADLESS_ACTIVE_MS", 30_000)
+# Task 子代理没有结束标记，只能看它那条 jsonl 多久没写了。
+SUBAGENT_ACTIVE_MS = env_int("AGENT_SIGNALS_SUBAGENT_ACTIVE_MS", 60_000)
+SUBAGENT_LINGER_MS = env_int("AGENT_SIGNALS_SUBAGENT_LINGER_MS", 600_000)
+# 一轮采样内多次取快照时不重复列目录 / 重扫桌面索引。
+SUBAGENT_LIST_TTL_MS = 5_000
+DESKTOP_INDEX_TTL_S = 60.0
+# 桌面 App 自带一份 claude 二进制，登记表没写 entrypoint 时只能靠它认。
+DESKTOP_COMMAND_MARKER = "Application Support/Claude/claude-code/"
 
 # ---- 历史埋点与费用估算（history / cost estimation） ----
 HISTORY_ENABLED = os.environ.get("AGENT_SIGNALS_HISTORY", "1") != "0"
@@ -145,6 +162,19 @@ STATUS_LABELS = {
 }
 NOTIFY_STATUSES = ("needs_input", "stalled", "completed")
 
+# 登记表里的 entrypoint 原样来自 $CLAUDE_CODE_ENTRYPOINT。认不出的原样显示。
+ENTRYPOINT_LABELS = {
+    "cli": "Terminal",
+    "claude-desktop": "桌面 App",
+    "claude-vscode": "VS Code",
+    "sdk-cli": "claude -p 后台",
+    "sdk-ts": "SDK",
+    "sdk-py": "SDK",
+    "mcp": "MCP",
+    "local-agent": "桌面 Cowork",
+    "local_agent": "桌面 Cowork",
+}
+
 CODEX_CORE_COLUMNS = frozenset({"id", "cwd", "source", "rollout_path"})
 CODEX_ACTIVITY_COLUMNS = (
     "recency_at_ms",
@@ -174,6 +204,8 @@ _activity: dict[str, dict[str, float]] = {}
 _rollout_cache: dict[str, tuple[tuple[float, int], tuple[str, int, dict[str, Any]]]] = {}
 _claude_load_cache: dict[str, tuple[tuple[float, int], dict[str, Any]]] = {}
 _transcript_paths: dict[str, Path] = {}
+_subagent_cache: dict[str, tuple[int, list[dict[str, Any]]]] = {}
+_desktop_index_cache: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
 _state_lock = threading.Lock()
 
 _snapshot_ready = threading.Condition()
@@ -246,6 +278,9 @@ def acknowledge_agent(agent: dict[str, Any]) -> bool:
     with _state_lock:
         for item in [agent, *(agent.get("satellites") or [])]:
             if item.get("status") != "completed":
+                continue
+            # 子代理卫星是一次性的信息展示，别把它们的 id 永久写进状态文件。
+            if item.get("origin") == "subagent":
                 continue
             completion_id = int(item.get("completionId") or 0)
             key = completion_key(platform, str(item.get("id") or ""))
@@ -560,6 +595,166 @@ def claude_status(
     return "completed" if mapped == "idle" and completed_at else mapped
 
 
+def load_desktop_index() -> dict[str, dict[str, Any]]:
+    """桌面 App 的会话索引，按 cliSessionId 建表；60 秒一刷，坏文件跳过。"""
+    root = CLAUDE_DESKTOP_SUPPORT_DIR / "claude-code-sessions"
+    key = str(root)
+    now = time.time()
+    cached = _desktop_index_cache.get(key)
+    if cached is not None and 0 <= now - cached[0] < DESKTOP_INDEX_TTL_S:
+        return cached[1]
+
+    index: dict[str, dict[str, Any]] = {}
+    if root.is_dir():
+        # 布局是 <账号>/<组织>/local_<uuid>.json。
+        for path in sorted(root.glob("*/*/local_*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            cli_session_id = str(data.get("cliSessionId") or "")
+            if not cli_session_id:
+                continue
+            index[cli_session_id] = {
+                "title": str(data.get("title") or ""),
+                "model": str(data.get("model") or ""),
+                "cwd": str(data.get("cwd") or data.get("originCwd") or ""),
+                "lastActivityAt": normalize_ms(data.get("lastActivityAt")),
+                "isArchived": bool(data.get("isArchived")),
+            }
+    _desktop_index_cache[key] = (now, index)
+    return index
+
+
+def claude_entrypoint(data: dict[str, Any], command: str) -> str:
+    """登记表写了就用它；没写时只有命令行能认出桌面 App 自带的那个二进制。"""
+    entrypoint = str(data.get("entrypoint") or "").strip()
+    if entrypoint:
+        return entrypoint
+    return "claude-desktop" if DESKTOP_COMMAND_MARKER in command else ""
+
+
+def parent_map(table: dict[str, Any]) -> dict[int, int]:
+    """把 ps 表的 children 反过来：子 pid → 父 pid。"""
+    parents: dict[int, int] = {}
+    for parent, kids in (table.get("children") or {}).items():
+        for kid in kids:
+            parents[kid] = parent
+    return parents
+
+
+def claude_host(
+    pid: int, parents: dict[int, int], hosts: dict[int, dict[str, Any]], depth: int = 8
+) -> dict[str, Any] | None:
+    """沿 PPID 链上溯，找第一个属于前台 Claude 会话的祖先；找不到返回 None。"""
+    current = parents.get(pid, 0)
+    for _ in range(depth):
+        if current <= 0:
+            return None
+        host = hosts.get(current)
+        if host is not None:
+            return host
+        current = parents.get(current, 0)
+    return None
+
+
+def satellite_of(agent: dict[str, Any], origin: str) -> dict[str, Any]:
+    """卫星只带这几个字段——尤其不带 load，卫星永远是轻量的。"""
+    return {
+        "id": agent["id"],
+        "name": agent["name"],
+        "status": agent["status"],
+        "completionId": agent["completionId"],
+        "origin": origin,
+    }
+
+
+def scan_subagents(session_id: str) -> list[dict[str, Any]]:
+    """列出 Task 子代理文件：只 stat jsonl，只读同名的小 meta，不碰对话内容。"""
+    parent = transcript_path(session_id)
+    if parent is None:
+        return []
+    directory = parent.parent / session_id / "subagents"
+    if not directory.is_dir():
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for meta_path in sorted(directory.glob("agent-*.meta.json")):
+        stem = meta_path.name[: -len(".meta.json")]
+        try:
+            mtime_ms = int(directory.joinpath(f"{stem}.jsonl").stat().st_mtime * 1000)
+        except OSError:
+            continue
+        name = stem
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            meta = None
+        if isinstance(meta, dict):
+            agent_type = str(meta.get("agentType") or "").strip()
+            description = clean_label(str(meta.get("description") or ""))
+            if agent_type and description:
+                name = f"{agent_type} · {description}"
+            else:
+                name = agent_type or description or stem
+        entries.append({"id": stem, "name": name, "mtimeMs": mtime_ms})
+    return entries
+
+
+def subagent_satellites(session_id: str, current_ms: int) -> list[dict[str, Any]]:
+    """Task 子代理当卫星：jsonl 还在动就是思考中，静下来一阵后不再显示。"""
+    cached = _subagent_cache.get(session_id)
+    if cached is not None and 0 <= current_ms - cached[0] < SUBAGENT_LIST_TTL_MS:
+        entries = cached[1]
+    else:
+        entries = scan_subagents(session_id)
+        if len(_subagent_cache) > 200:
+            _subagent_cache.clear()
+        _subagent_cache[session_id] = (current_ms, entries)
+
+    satellites: list[dict[str, Any]] = []
+    for entry in entries:
+        quiet_for = current_ms - int(entry["mtimeMs"])
+        if quiet_for >= SUBAGENT_LINGER_MS:
+            continue
+        done = quiet_for >= SUBAGENT_ACTIVE_MS
+        satellites.append(
+            {
+                "id": entry["id"],
+                "name": entry["name"],
+                "status": "completed" if done else "thinking",
+                "completionId": int(entry["mtimeMs"]) if done else 0,
+                "origin": "subagent",
+            }
+        )
+    return satellites
+
+
+def claude_claimed_pids(table: dict[str, Any]) -> set[int]:
+    """登记表里的每个 pid 及其全部子孙——给进程发现器去重用。"""
+    claimed: set[int] = set()
+    if not CLAUDE_SESSIONS_DIR.exists():
+        return claimed
+    children = table.get("children") or {}
+    stack: list[int] = []
+    for path in sorted(CLAUDE_SESSIONS_DIR.glob("*.json")):
+        try:
+            pid = int(json.loads(path.read_text(encoding="utf-8")).get("pid") or 0)
+        except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+            continue
+        if pid > 0:
+            stack.append(pid)
+    while stack:
+        pid = stack.pop()
+        if pid in claimed:
+            continue
+        claimed.add(pid)
+        stack.extend(children.get(pid, ()))
+    return claimed
+
+
 def load_claude_sessions(
     current_ms: int | None = None, table: dict[str, Any] | None = None
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
@@ -581,73 +776,124 @@ def load_claude_sessions(
         except (OSError, json.JSONDecodeError):
             continue
     commands = command_lines({int(data.get("pid") or 0) for data in sessions})
+    scanned = table.get("commands") or {}
+    desktop_index = load_desktop_index()
+    sdk_lights: list[dict[str, Any]] = []
 
     for data in sessions:
         pid = int(data.get("pid") or 0)
         alive = process_alive(pid, commands)
-        updated_at = normalize_ms(data.get("statusUpdatedAt") or data.get("updatedAt"))
+        updated_at = normalize_ms(
+            data.get("statusUpdatedAt")
+            or data.get("updatedAt")
+            # headless 的登记表两个都不写，只有 startedAt。
+            or data.get("startedAt")
+        )
         session_id = str(data.get("sessionId") or pid)
-        status = claude_status(
-            session_id,
-            str(data.get("status") or "idle"),
-            alive,
-            updated_at,
-            current_ms,
-        )
-        completion_id = int(
-            _claude_transitions.get(session_id, {}).get("completed_at", 0)
-        )
-        if status == "offline":
-            continue
+        kind = str(data.get("kind") or "interactive")
+        entrypoint = claude_entrypoint(data, scanned.get(pid) or commands.get(pid, ""))
 
+        # note_activity 每轮采样只算一次，提前调用不改变它的结果；
+        # headless 会话没有 status 字段，只能拿它的 quietSince 反推。
         quiet_since = note_activity(
             completion_key("claude", session_id),
             tree_cpu(pid, table),
             transcript_mtime(session_id),
             current_ms,
         )
+        headless = "status" not in data
+        if headless:
+            raw_status = (
+                "busy"
+                if current_ms - quiet_since < CLAUDE_HEADLESS_ACTIVE_MS
+                else "idle"
+            )
+        else:
+            raw_status = str(data.get("status") or "idle")
+
+        status = claude_status(session_id, raw_status, alive, updated_at, current_ms)
+        completion_id = int(
+            _claude_transitions.get(session_id, {}).get("completed_at", 0)
+        )
+        if status == "offline":
+            continue
+
         status = apply_stall(
             status, current_ms - updated_at, current_ms - quiet_since
         )
+
+        name = str(data.get("name") or "")
+        detail = ENTRYPOINT_LABELS.get(entrypoint, entrypoint or "Terminal")
+        open_via = "app:Claude" if entrypoint == "claude-desktop" else "tty"
+        desktop = desktop_index.get(session_id)
+        if desktop is not None:
+            # 自动起的名字让位给桌面 App 自己的标题，手起的名字不动。
+            if str(data.get("nameSource") or "") == "derived" or not name:
+                name = clean_label(str(desktop.get("title") or ""), fallback=name)
+            detail = "桌面 App"
+            open_via = "app:Claude"
 
         agent = {
             "id": session_id,
             "pid": pid,
             "platform": "claude",
-            "name": str(data.get("name") or f"terminal-{pid}"),
+            "name": name or f"terminal-{pid}",
             "status": status,
-            "detail": "Terminal",
+            "detail": detail,
             "cwd": str(data.get("cwd") or ""),
             "cwdLabel": cwd_label(str(data.get("cwd") or "")),
             "updatedAt": updated_at,
             "quietSince": quiet_since,
             "completionId": completion_id if status == "completed" else 0,
-            "openable": alive and str(data.get("kind") or "interactive") == "interactive",
+            # headless 会话没有可切过去的界面，点了也没有意义。
+            "openable": alive and kind == "interactive" and not headless,
+            # 这一批灯全部来自登记表；进程发现器认领的那些走别的 origin。
+            "origin": "registry",
+            "openVia": open_via,
             "satellites": [],
         }
         apply_completion_acknowledgement("claude", agent)
-        if str(data.get("kind") or "interactive") == "interactive":
+        if kind == "interactive":
             agent["load"] = claude_load(session_id)
             foreground.append(agent)
+            if entrypoint == "sdk-cli":
+                sdk_lights.append(agent)
         else:
             agent["name"] = str(data.get("name") or "后台任务")
             background.append(agent)
 
     foreground.sort(key=lambda item: item["updatedAt"], reverse=True)
+    parents = parent_map(table)
+    # 会被挂走的那些自己不能当宿主，否则卫星可能挂到一盏已经消失的灯上。
+    attachable = {agent["pid"] for agent in background + sdk_lights}
+    hosts = {
+        agent["pid"]: agent
+        for agent in foreground
+        if agent["pid"] > 0 and agent["pid"] not in attachable
+    }
+
+    # `claude -p` 认得出父会话就挂过去，认不出就自己当一盏灯。
+    adopted: set[int] = set()
+    for agent in sdk_lights:
+        host = claude_host(agent["pid"], parents, hosts)
+        if host is not None:
+            host["satellites"].append(satellite_of(agent, "registry"))
+            adopted.add(id(agent))
+    if adopted:
+        foreground = [item for item in foreground if id(item) not in adopted]
+
     for satellite in background:
-        parent = next(
-            (item for item in foreground if item["cwd"] == satellite["cwd"]),
-            foreground[0] if foreground else None,
-        )
-        if parent:
-            parent["satellites"].append(
-                {
-                    "id": satellite["id"],
-                    "name": satellite["name"],
-                    "status": satellite["status"],
-                    "completionId": satellite["completionId"],
-                }
+        parent = claude_host(satellite["pid"], parents, hosts)
+        if parent is None:
+            parent = next(
+                (item for item in foreground if item["cwd"] == satellite["cwd"]),
+                foreground[0] if foreground else None,
             )
+        if parent:
+            parent["satellites"].append(satellite_of(satellite, "registry"))
+
+    for agent in foreground:
+        agent["satellites"].extend(subagent_satellites(agent["id"], current_ms))
     return foreground, {"state": "live", "detail": ""}
 
 
@@ -1098,6 +1344,8 @@ def prune_tracking(live_keys: set[str]) -> None:
         _transcript_paths.pop(key, None)
     for key in [key for key in _claude_load_cache if key not in live_sessions]:
         _claude_load_cache.pop(key, None)
+    for key in [key for key in _subagent_cache if key not in live_sessions]:
+        _subagent_cache.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -2818,8 +3066,8 @@ def terminal_tty(pid: int) -> str:
     return tty if tty.startswith("/dev/") else f"/dev/{tty}"
 
 
-def open_claude(agent: dict[str, Any]) -> None:
-    tty = terminal_tty(int(agent["pid"]))
+def open_terminal_tab(pid: int) -> None:
+    tty = terminal_tty(pid)
     script = """
 on run argv
   set targetTTY to item 1 of argv
@@ -2873,6 +3121,26 @@ end run
         raise RuntimeError(result.stderr.strip() or "无法打开 Terminal 标签页")
     if result.stdout.strip() != "ok":
         raise RuntimeError("已找到 Terminal 标签页，但未能切换到前台")
+
+
+def open_desktop_app() -> None:
+    result = subprocess.run(
+        ["open", "-a", "Claude"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "无法打开 Claude 桌面 App")
+
+
+def open_claude(agent: dict[str, Any]) -> None:
+    """按灯自己带的 openVia 分派：终端标签页，还是桌面 App。"""
+    if str(agent.get("openVia") or "tty") == "app:Claude":
+        open_desktop_app()
+        return
+    open_terminal_tab(int(agent["pid"]))
 
 
 def open_codex(agent: dict[str, Any]) -> None:
