@@ -12,9 +12,10 @@ import sqlite3
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 
@@ -32,6 +33,7 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
+APP_VERSION = "2.0.0"
 SCHEMA_VERSION = 1
 
 ROOT = Path(__file__).resolve().parent
@@ -286,50 +288,91 @@ def parse_cpu_time(value: str) -> float:
     return total
 
 
+def parse_etime(value: str) -> int:
+    """ps 的 etime：`ss` / `mm:ss` / `hh:mm:ss` / `dd-hh:mm:ss`，返回整秒。"""
+    text = value.strip()
+    if not text:
+        return 0
+    days = 0
+    if "-" in text:
+        head, _, text = text.partition("-")
+        try:
+            days = int(head)
+        except ValueError:
+            return 0
+    seconds = 0
+    for part in text.split(":"):
+        try:
+            seconds = seconds * 60 + int(part)
+        except ValueError:
+            return 0
+    return days * 86_400 + seconds
+
+
+def empty_process_table() -> dict[str, Any]:
+    return {"children": {}, "cpu": {}, "commands": {}, "start_s": {}, "uid": {}}
+
+
+# 最近一次 scan_processes() 的结果：command_lines 优先读它，省掉每轮的 ps -p。
+_last_table: dict[str, Any] = empty_process_table()
+
+
 def scan_processes() -> dict[str, Any]:
-    """One ps sweep per sample for CPU accounting; command lines cost extra."""
-    table: dict[str, Any] = {"children": {}, "cpu": {}}
+    """One ps sweep per sample: parentage, CPU, command line, start time, uid."""
+    global _last_table
+    table = empty_process_table()
     try:
         result = subprocess.run(
-            ["ps", "-A", "-o", "pid=,ppid=,time="],
+            ["ps", "-axo", "pid=,ppid=,uid=,time=,etime=,command="],
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
+        _last_table = table
         return table
 
+    current_s = now_ms() // 1000
     for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 3:
+        # command= 是最后一列且含空格，限定 maxsplit 让它整段活下来。
+        parts = line.split(None, 5)
+        if len(parts) < 5:
             continue
         try:
-            pid, parent = int(parts[0]), int(parts[1])
+            pid, parent, uid = int(parts[0]), int(parts[1]), int(parts[2])
         except ValueError:
             continue
-        table["cpu"][pid] = parse_cpu_time(parts[2])
+        table["cpu"][pid] = parse_cpu_time(parts[3])
         table["children"].setdefault(parent, []).append(pid)
+        table["start_s"][pid] = current_s - parse_etime(parts[4])
+        table["uid"][pid] = uid
+        table["commands"][pid] = parts[5] if len(parts) > 5 else ""
+    _last_table = table
     return table
 
 
 def command_lines(pids: set[int]) -> dict[int, str]:
-    """Full command lines, asked for only the handful of pids we care about."""
+    """Full command lines, served from the last sweep; ps only for the strays."""
     wanted = sorted(pid for pid in pids if pid > 0)
     if not wanted:
         return {}
+    scanned: dict[int, str] = _last_table["commands"]
+    commands = {pid: scanned[pid] for pid in wanted if pid in scanned}
+    missing = [pid for pid in wanted if pid not in scanned]
+    if not missing:
+        return commands
     try:
         result = subprocess.run(
-            ["ps", "-p", ",".join(str(pid) for pid in wanted), "-o", "pid=,command="],
+            ["ps", "-p", ",".join(str(pid) for pid in missing), "-o", "pid=,command="],
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return {}
+        return commands
 
-    commands: dict[int, str] = {}
     for line in result.stdout.splitlines():
         parts = line.split(None, 1)
         if len(parts) < 2:
@@ -1042,7 +1085,13 @@ def prune_tracking(live_keys: set[str]) -> None:
     """Sessions come and go; do not let the tracking dicts grow forever."""
     for key in [key for key in _activity if key not in live_keys]:
         _activity.pop(key, None)
-    live_sessions = {key.split(":", 1)[1] for key in live_keys if key.startswith("claude:")}
+    # 按每个已注册源的 completion_key 前缀剥出原生 id，不再只认 "claude:"。
+    live_sessions = {
+        key.split(":", 1)[1]
+        for spec in SOURCES
+        for key in live_keys
+        if key.startswith(f"{spec.key}:")
+    }
     for key in [key for key in _claude_transitions if key not in live_sessions]:
         _claude_transitions.pop(key, None)
     for key in [key for key in _transcript_paths if key not in live_sessions]:
@@ -1792,14 +1841,15 @@ def recompute_session(connection: sqlite3.Connection, session_key: str) -> None:
         row["cache_write_5m_tokens"],
         row["cache_write_1h_tokens"],
     ]
-    if str(session["platform"]) == "codex":
+    cost_mode = cost_mode_for(str(session["platform"]))
+    if cost_mode == "codex":
         # OpenAI 口径 input 已含 cached，总量 = input + output。
         token_parts = [row["input_tokens"], row["output_tokens"]]
     known_parts = [part for part in token_parts if part is not None]
     total = sum(known_parts) if known_parts else session["total_tokens"]
 
     window = session["context_window"]
-    if str(session["platform"]) == "claude" and not window:
+    if cost_mode == "claude" and not window:
         window = CLAUDE_CONTEXT_WINDOW if CLAUDE_CONTEXT_WINDOW > 0 else None
     peak = row["context_peak"]
     pct = None
@@ -2055,7 +2105,9 @@ def ingest_target(
     if not isinstance(cursor, dict):
         cursor = {}
 
-    if state is None and target["platform"] == "codex":
+    # 读哪种日志方言，跟着注册表登记的记账口径走。
+    dialect = cost_mode_for(str(target["platform"]))
+    if state is None and dialect == "codex":
         prior = connection.execute(
             "SELECT COUNT(*) FROM turns WHERE session_key=? "
             "AND input_tokens IS NOT NULL",
@@ -2076,7 +2128,7 @@ def ingest_target(
     )
     touched = False
     if lines:
-        if target["platform"] == "claude":
+        if dialect == "claude":
             touched = ingest_claude_lines(connection, session_key, lines, cursor)
         else:
             touched = ingest_codex_events(connection, session_key, lines, cursor)
@@ -2108,20 +2160,28 @@ def ingest_target(
     return max(0, new_offset - offset), touched
 
 
+def live_status_map(snap: dict[str, Any]) -> dict[str, str]:
+    """一份快照里所有主会话与卫星的 `platform:id → status`。"""
+    live: dict[str, str] = {}
+    for spec in SOURCES:
+        for agent in snap.get(spec.key, []):
+            live[completion_key(spec.key, agent["id"])] = str(
+                agent.get("status") or ""
+            )
+            for satellite in agent.get("satellites", []):
+                live[completion_key(spec.key, satellite["id"])] = str(
+                    satellite.get("status") or ""
+                )
+    return live
+
+
 def mark_ended_sessions(connection: sqlite3.Connection) -> None:
     """用最近一次快照对账：从面板上消失的会话盖上结束时间。"""
     with _snapshot_ready:
         snap = _latest_snapshot
     if snap is None:
         return
-    live: dict[str, str] = {}
-    for platform in ("claude", "codex"):
-        for agent in snap.get(platform, []):
-            live[f"{platform}:{agent['id']}"] = str(agent.get("status") or "")
-            for satellite in agent.get("satellites", []):
-                live[f"{platform}:{satellite['id']}"] = str(
-                    satellite.get("status") or ""
-                )
+    live = live_status_map(snap)
     rows = connection.execute(
         "SELECT session_key, last_active_at_ms, ended_at_ms FROM sessions "
         "WHERE parent_session_key IS NULL OR platform='codex'"
@@ -2168,7 +2228,9 @@ def history_pass(db_path: Path | None = None) -> None:
     connection = history_connect(db_path)
     try:
         history_init(connection)
-        targets = claude_history_targets() + codex_history_targets()
+        targets: list[dict[str, Any]] = []
+        for spec in SOURCES:
+            targets.extend(spec.history_targets())
 
         def target_mtime(target: dict[str, Any]) -> float:
             try:
@@ -2224,7 +2286,7 @@ def _cost_for(
     claude_prices: dict[str, dict[str, float]],
     codex_prices: dict[str, dict[str, float]],
 ) -> int | None:
-    if platform == "codex":
+    if cost_mode_for(platform) == "codex":
         return codex_cost_microusd(
             {
                 "input": tokens.get("input"),
@@ -2248,17 +2310,7 @@ def _cost_for(
 def _live_status_map() -> dict[str, str]:
     with _snapshot_ready:
         snap = _latest_snapshot
-    live: dict[str, str] = {}
-    if snap is None:
-        return live
-    for platform in ("claude", "codex"):
-        for agent in snap.get(platform, []):
-            live[f"{platform}:{agent['id']}"] = str(agent.get("status") or "")
-            for satellite in agent.get("satellites", []):
-                live[f"{platform}:{satellite['id']}"] = str(
-                    satellite.get("status") or ""
-                )
-    return live
+    return live_status_map(snap) if snap is not None else {}
 
 
 def _session_object(
@@ -2268,6 +2320,7 @@ def _session_object(
     codex_prices: dict[str, dict[str, float]],
 ) -> dict[str, Any]:
     platform = str(row["platform"])
+    spec = source_for(platform)
     key = str(row["session_key"])
     tokens = _session_tokens(row)
     try:
@@ -2305,7 +2358,7 @@ def _session_object(
         "costMicroUsd": _cost_for(
             platform, row["model"], tokens, claude_prices, codex_prices
         ),
-        "costLabel": "估算" if platform == "codex" else "等效API标价",
+        "costLabel": spec.cost_label if spec is not None else "等效API标价",
     }
 
 
@@ -2465,30 +2518,120 @@ def history_session_payload(session_key: str, turns_limit: int) -> dict[str, Any
     return payload
 
 
+# ---------------------------------------------------------------------------
+# 数据源注册表
+#
+# 每个来源（本机 Claude Code、Codex Desktop，往后还有别的运行时）在这里登记
+# 一次：怎么采、怎么打开、历史埋点读哪些文件、计费口径、UI 有哪些开关。采集与
+# 分发一律遍历 SOURCES，不再让 ("claude", "codex") 这对字面量散落各处。
+#
+# 回调一律写成 lambda：注册表在模块加载时就建好，而 open_* 在它后面才定义；
+# 延迟到调用时才解析全局名字，也让测试里的 patch.object(server, ...) 继续生效。
+# ---------------------------------------------------------------------------
+
+# 一轮采样共享的输入：当前时刻、这一轮的 ps 表、客户端钉住的 id。
+SampleContext = dict[str, Any]
+
+
+@dataclass
+class SourceSpec:
+    """一个数据源身上所有随源而变的东西。"""
+
+    key: str
+    label: str
+    order: int
+    kind: str
+    load: Callable[[SampleContext], tuple[list[dict[str, Any]], dict[str, str]]]
+    open: Callable[[dict[str, Any]], None]
+    history_targets: Callable[[], list[dict[str, Any]]]
+    cost_mode: str
+    cost_label: str
+    dismissible: bool
+    lockable: bool
+    hint: str
+    empty_text: str
+
+
+claude_spec = SourceSpec(
+    key="claude",
+    label="Claude Code",
+    order=0,
+    kind="local",
+    load=lambda ctx: load_claude_sessions(ctx["current_ms"], ctx["table"]),
+    open=lambda agent: open_claude(agent),
+    history_targets=lambda: claude_history_targets(),
+    cost_mode="claude",
+    cost_label="等效API标价",
+    dismissible=False,
+    lockable=False,
+    hint="终端里的 Claude Code 会话",
+    empty_text="没有正在运行的 Claude 会话",
+)
+
+codex_spec = SourceSpec(
+    key="codex",
+    label="Codex",
+    order=1,
+    kind="local",
+    load=lambda ctx: load_codex_threads(ctx["current_ms"], ctx["locked_ids"]),
+    open=lambda agent: open_codex(agent),
+    history_targets=lambda: codex_history_targets(),
+    cost_mode="codex",
+    cost_label="估算",
+    dismissible=True,
+    lockable=True,
+    hint="Codex Desktop 的任务",
+    empty_text="没有正在运行的 Codex 任务",
+)
+
+# 按 order 排好序声明；载荷里的先后就是这里的先后。
+SOURCES: list[SourceSpec] = [claude_spec, codex_spec]
+
+
+def source_for(platform: str) -> SourceSpec | None:
+    return next((spec for spec in SOURCES if spec.key == platform), None)
+
+
+def cost_mode_for(platform: str) -> str:
+    """注册表登记的记账口径；没登记的平台按自己的 key 走老路径。"""
+    spec = source_for(platform)
+    return spec.cost_mode if spec is not None else platform
+
+
 def snapshot(locked_codex_ids: set[str] | None = None) -> dict[str, Any]:
     current_ms = now_ms()
-    table = scan_processes()
-    claude, claude_health = load_claude_sessions(current_ms, table)
-    codex, codex_health = load_codex_threads(current_ms, locked_codex_ids)
+    context: SampleContext = {
+        "current_ms": current_ms,
+        "table": scan_processes(),
+        "locked_ids": locked_codex_ids or set(),
+    }
+    agents: dict[str, list[dict[str, Any]]] = {}
+    sources: dict[str, dict[str, str]] = {}
+    for spec in SOURCES:
+        agents[spec.key], sources[spec.key] = spec.load(context)
+
     prune_tracking(
-        {completion_key("claude", agent["id"]) for agent in claude}
-        | {completion_key("codex", agent["id"]) for agent in codex}
+        {
+            completion_key(spec.key, agent["id"])
+            for spec in SOURCES
+            for agent in agents[spec.key]
+        }
     )
-    return {
+    counts: dict[str, int] = {spec.key: len(agents[spec.key]) for spec in SOURCES}
+    counts["satellites"] = sum(
+        len(agent["satellites"])
+        for spec in SOURCES
+        for agent in agents[spec.key]
+    )
+    payload: dict[str, Any] = {
         "schemaVersion": SCHEMA_VERSION,
         "generatedAt": current_ms,
-        "sources": {"claude": claude_health, "codex": codex_health},
+        "sources": sources,
         "notifications": dict(_notify_health),
-        "claude": claude,
-        "codex": codex,
-        "counts": {
-            "claude": len(claude),
-            "codex": len(codex),
-            "satellites": sum(
-                len(agent["satellites"]) for agent in [*claude, *codex]
-            ),
-        },
     }
+    payload.update(agents)
+    payload["counts"] = counts
+    return payload
 
 
 def snapshot_revision(payload: dict[str, Any]) -> str:
@@ -2535,9 +2678,9 @@ def dispatch_notifications(payload: dict[str, Any]) -> list[str]:
     global _notify_primed
     current_ms = int(payload.get("generatedAt") or now_ms())
     agents = [
-        (platform, agent)
-        for platform in ("claude", "codex")
-        for agent in payload.get(platform, [])
+        (spec.key, agent)
+        for spec in SOURCES
+        for agent in payload.get(spec.key, [])
     ]
     interesting = [
         (platform, agent)
@@ -2745,7 +2888,11 @@ def open_codex(agent: dict[str, Any]) -> None:
 
 
 def find_agent(platform: str, agent_id: str) -> dict[str, Any] | None:
-    locked = {agent_id} if platform == "codex" else None
+    spec = source_for(platform)
+    if spec is None:
+        return None
+    # 可锁定的源要把这一条钉住，否则它可能刚好在这一轮被隐藏掉。
+    locked = {agent_id} if spec.lockable else None
     agents = snapshot(locked).get(platform, [])
     return next((item for item in agents if item["id"] == agent_id), None)
 
@@ -2821,7 +2968,15 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_agents(parse_qs(parsed.query))
             return
         if path == "/health":
-            self.send_json({"ok": True})
+            self.send_json(
+                {
+                    "ok": True,
+                    "version": APP_VERSION,
+                    "schemaVersion": SCHEMA_VERSION,
+                    "platforms": [spec.key for spec in SOURCES],
+                    "pid": os.getpid(),
+                }
+            )
             return
         if path == "/api/history":
             query = parse_qs(parsed.query)
@@ -2869,7 +3024,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "请求格式错误"}, 400)
             return
 
-        if platform not in {"claude", "codex"}:
+        spec = source_for(platform)
+        if spec is None:
             self.send_json({"error": "未知平台"}, 400)
             return
         agent = find_agent(platform, agent_id)
@@ -2877,7 +3033,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "会话已经离线或不可打开"}, 404)
             return
         try:
-            open_claude(agent) if platform == "claude" else open_codex(agent)
+            spec.open(agent)
         except (OSError, RuntimeError, subprocess.SubprocessError) as error:
             self.send_json({"error": str(error)}, 500)
             return

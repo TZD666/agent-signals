@@ -1,6 +1,8 @@
 import importlib.util
 import json
+import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 import urllib.error
@@ -15,6 +17,8 @@ SPEC = importlib.util.spec_from_file_location(
     "agent_status_server", Path(__file__).parents[1] / "server.py"
 )
 server = importlib.util.module_from_spec(SPEC)
+# dataclasses 解析注解时要回查 sys.modules[__module__]，先登记再执行。
+sys.modules[SPEC.name] = server
 SPEC.loader.exec_module(server)
 
 
@@ -803,6 +807,232 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(sender.call_count, server.NOTIFY_MAX_PER_MINUTE)
 
 
+PS_SWEEP = (
+    "  501     1   501   12:34.56    01:02:03 /usr/bin/python3 server.py --port 8812\n"
+    "  777   501     0    0:00.10       05:00 claude --bg-spare\n"
+    "  888   501   501    1:00.00  2-03:04:05 codex app\n"
+    "  902   501   501       0:00          17 /bin/sh\n"
+    "垃圾行\n"
+)
+EMPTY_TABLE = {"children": {}, "cpu": {}, "commands": {}, "start_s": {}, "uid": {}}
+
+
+class ProcessTableTests(unittest.TestCase):
+    def setUp(self):
+        # scan_processes 会写模块级 _last_table，别把它漏给后面的用例。
+        self.addCleanup(setattr, server, "_last_table", server._last_table)
+
+    def test_parse_etime_handles_every_ps_shape(self):
+        self.assertEqual(server.parse_etime("17"), 17)
+        self.assertEqual(server.parse_etime("05:00"), 300)
+        self.assertEqual(server.parse_etime("01:02:03"), 3723)
+        self.assertEqual(server.parse_etime("2-03:04:05"), 183_845)
+        self.assertEqual(server.parse_etime(""), 0)
+        self.assertEqual(server.parse_etime("垃圾"), 0)
+
+    def test_scan_parses_etime_and_commands(self):
+        with patch.object(server, "now_ms", return_value=1_000_000_000_000), patch.object(
+            server.subprocess, "run", return_value=Mock(stdout=PS_SWEEP)
+        ) as run:
+            table = server.scan_processes()
+
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(
+            run.call_args[0][0],
+            ["ps", "-axo", "pid=,ppid=,uid=,time=,etime=,command="],
+        )
+        self.assertEqual(
+            table["commands"],
+            {
+                501: "/usr/bin/python3 server.py --port 8812",
+                777: "claude --bg-spare",
+                888: "codex app",
+                902: "/bin/sh",
+            },
+        )
+        self.assertEqual(
+            table["start_s"],
+            {
+                501: 999_996_277,
+                777: 999_999_700,
+                888: 999_816_155,
+                902: 999_999_983,
+            },
+        )
+        self.assertEqual(table["uid"], {501: 501, 777: 0, 888: 501, 902: 501})
+        # 老字段一个不动：其他代码依赖 children / cpu。
+        self.assertEqual(table["children"], {1: [501], 501: [777, 888, 902]})
+        self.assertAlmostEqual(table["cpu"][501], 754.56)
+        self.assertAlmostEqual(table["cpu"][888], 60.0)
+
+    def test_command_lines_reads_from_table_first(self):
+        table = dict(EMPTY_TABLE, commands={101: "claude --resume abc"})
+        with patch.object(server, "_last_table", table), patch.object(
+            server.subprocess, "run"
+        ) as run:
+            self.assertEqual(
+                server.command_lines({101}), {101: "claude --resume abc"}
+            )
+        run.assert_not_called()
+
+    def test_command_lines_falls_back_for_pids_outside_the_table(self):
+        table = dict(EMPTY_TABLE, commands={101: "claude --resume abc"})
+        with patch.object(server, "_last_table", table), patch.object(
+            server.subprocess,
+            "run",
+            return_value=Mock(stdout="  202 codex --headless\n"),
+        ) as run:
+            commands = server.command_lines({101, 202})
+        self.assertEqual(
+            commands, {101: "claude --resume abc", 202: "codex --headless"}
+        )
+        # 只为缺失的 pid 付一次 ps 的钱。
+        self.assertEqual(run.call_args[0][0][2], "202")
+
+
+GOLDEN_CLAUDE = [
+    {
+        "id": "sid-1",
+        "platform": "claude",
+        "name": "edy-d6",
+        "status": "thinking",
+        "pid": 4242,
+        "cwdLabel": "项目",
+        "openable": True,
+        "completionId": 0,
+        "satellites": [
+            {"id": "sid-1/agent-a", "name": "Explore", "status": "thinking"},
+            {"id": "sid-1/agent-b", "name": "Plan", "status": "completed"},
+        ],
+    },
+    {
+        "id": "sid-2",
+        "platform": "claude",
+        "name": "edy-d7",
+        "status": "needs_input",
+        "pid": 4243,
+        "cwdLabel": "另一个项目",
+        "openable": True,
+        "completionId": 3,
+        "satellites": [],
+    },
+]
+GOLDEN_CODEX = [
+    {
+        "id": "thread-1",
+        "platform": "codex",
+        "name": "Codex",
+        "status": "completed",
+        "cwdLabel": "项目",
+        "openable": True,
+        "completionId": 1,
+        "satellites": [
+            {"id": "thread-2", "name": "子代理", "status": "thinking"},
+        ],
+    },
+]
+GOLDEN_CLAUDE_HEALTH = {"state": "live", "detail": ""}
+GOLDEN_CODEX_HEALTH = {"state": "live", "detail": "兼容读取"}
+GOLDEN_NOTIFY_HEALTH = {"state": "ok", "detail": ""}
+
+
+class SnapshotPayloadTests(unittest.TestCase):
+    """载荷是 iPad 前端的契约：重构可以动内部，不许动这张表。"""
+
+    def take(self, locked=None):
+        with patch.object(
+            server, "scan_processes", return_value=dict(EMPTY_TABLE)
+        ), patch.object(
+            server,
+            "load_claude_sessions",
+            return_value=(GOLDEN_CLAUDE, GOLDEN_CLAUDE_HEALTH),
+        ), patch.object(
+            server,
+            "load_codex_threads",
+            return_value=(GOLDEN_CODEX, GOLDEN_CODEX_HEALTH),
+        ), patch.object(
+            server, "_notify_health", dict(GOLDEN_NOTIFY_HEALTH)
+        ):
+            return server.snapshot(locked)
+
+    def test_snapshot_payload_is_schema1_golden(self):
+        payload = self.take({"thread-1"})
+        self.assertIsInstance(payload.pop("generatedAt"), int)
+        self.assertEqual(
+            payload,
+            {
+                "schemaVersion": 1,
+                "sources": {
+                    "claude": {"state": "live", "detail": ""},
+                    "codex": {"state": "live", "detail": "兼容读取"},
+                },
+                "notifications": {"state": "ok", "detail": ""},
+                "claude": [
+                    {
+                        "id": "sid-1",
+                        "platform": "claude",
+                        "name": "edy-d6",
+                        "status": "thinking",
+                        "pid": 4242,
+                        "cwdLabel": "项目",
+                        "openable": True,
+                        "completionId": 0,
+                        "satellites": [
+                            {
+                                "id": "sid-1/agent-a",
+                                "name": "Explore",
+                                "status": "thinking",
+                            },
+                            {
+                                "id": "sid-1/agent-b",
+                                "name": "Plan",
+                                "status": "completed",
+                            },
+                        ],
+                    },
+                    {
+                        "id": "sid-2",
+                        "platform": "claude",
+                        "name": "edy-d7",
+                        "status": "needs_input",
+                        "pid": 4243,
+                        "cwdLabel": "另一个项目",
+                        "openable": True,
+                        "completionId": 3,
+                        "satellites": [],
+                    },
+                ],
+                "codex": [
+                    {
+                        "id": "thread-1",
+                        "platform": "codex",
+                        "name": "Codex",
+                        "status": "completed",
+                        "cwdLabel": "项目",
+                        "openable": True,
+                        "completionId": 1,
+                        "satellites": [
+                            {
+                                "id": "thread-2",
+                                "name": "子代理",
+                                "status": "thinking",
+                            },
+                        ],
+                    },
+                ],
+                "counts": {"claude": 2, "codex": 1, "satellites": 3},
+            },
+        )
+
+    def test_revision_stable_across_identical_samples(self):
+        first = self.take()
+        second = self.take()
+        second["generatedAt"] = first["generatedAt"] + 5_000
+        self.assertEqual(
+            server.snapshot_revision(first), server.snapshot_revision(second)
+        )
+
+
 class HttpTests(unittest.TestCase):
     def setUp(self):
         self.payload = {
@@ -875,6 +1105,15 @@ class HttpTests(unittest.TestCase):
         with self.get("/api/agents") as response:
             body = json.loads(response.read())
         self.assertEqual(body["sources"]["codex"]["state"], "live")
+
+    def test_health_carries_version_and_platforms(self):
+        with self.get("/health") as response:
+            body = json.loads(response.read())
+        self.assertEqual(body["ok"], True)
+        self.assertEqual(body["version"], server.APP_VERSION)
+        self.assertEqual(body["schemaVersion"], server.SCHEMA_VERSION)
+        self.assertEqual(body["platforms"], ["claude", "codex"])
+        self.assertEqual(body["pid"], os.getpid())
 
 
 if __name__ == "__main__":
