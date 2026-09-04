@@ -46,7 +46,19 @@
 - 计价口径差异：Codex 的 `input_tokens` 已含 `cached_input_tokens`，计价先减；Claude 四类 token（输入 / 输出 / 缓存读 / 缓存写 5m·1h）分开计价，1h 缓存写按 2× input。
 - 已知限制：`--resume` 会话会把旧轮次记进新会话——单会话视图诚实，跨会话求和会重复计入。
 
-`agent-history.db` 与 `codex_prices.json` 落在服务运行目录（launchd 部署即 `~/Library/Application Support/AgentSignals/`），重启与重新部署（只 cp `server.py` + `static/*`）都不会清掉它们。
+`agent-history.db` 与 `codex_prices.json` 落在服务运行目录（launchd 部署即 `~/Library/Application Support/AgentSignals/`），重启与重新部署都不会清掉它们。
+
+## 部署
+
+部署只走 `./deploy.sh`，不要手动 cp：
+
+```
+./deploy.sh
+```
+
+四步固定顺序：跑测试（用 launchd 里那个 `/usr/bin/python3`）→ 拷 `server.py` 与 `static/*` 到运行目录 → `launchctl kickstart -k` 重启服务 → 轮询 `/health` 直到 `version` 与 `server.py` 里的 `APP_VERSION` 对上（20 秒超时，超时会打印 `agent-signals.err.log` 末尾并非零退出）。测试不过就一个文件都不拷。
+
+`agent-history.db`、`codex_prices.json`、`.agent-signals-state.json`、`runtime-profiles.json` 是运行时数据，脚本永远不覆盖它们。运行目录默认 `~/Library/Application Support/AgentSignals`，可用 `AGENT_SIGNALS_DEPLOY_DIR` 覆盖。
 
 ## 数据源健康度
 
@@ -130,4 +142,5 @@ static/manifest.webmanifest
 tests/test_server.py      呼吸灯主功能测试
 tests/test_history.py     历史埋点与费用估算测试
 run.command               双击启动
+deploy.sh                 部署到 launchd 运行目录（测试 → 拷贝 → 重启 → 验版本）
 ```
