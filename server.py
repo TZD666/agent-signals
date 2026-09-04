@@ -33,8 +33,8 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
-APP_VERSION = "2.1.1"
-SCHEMA_VERSION = 1
+APP_VERSION = "2.2.0"
+SCHEMA_VERSION = 2
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
@@ -1337,13 +1337,9 @@ def prune_tracking(live_keys: set[str]) -> None:
     """Sessions come and go; do not let the tracking dicts grow forever."""
     for key in [key for key in _activity if key not in live_keys]:
         _activity.pop(key, None)
-    # 按每个已注册源的 completion_key 前缀剥出原生 id，不再只认 "claude:"。
-    live_sessions = {
-        key.split(":", 1)[1]
-        for spec in SOURCES
-        for key in live_keys
-        if key.startswith(f"{spec.key}:")
-    }
+    # completion_key 一律是 "<platform>:<原生 id>"，按第一个冒号剥出原生 id
+    # 即可，不再只认 "claude:"，也不必挨个源去比前缀。
+    live_sessions = {key.split(":", 1)[1] for key in live_keys if ":" in key}
     for key in [key for key in _claude_transitions if key not in live_sessions]:
         _claude_transitions.pop(key, None)
     for key in [key for key in _transcript_paths if key not in live_sessions]:
@@ -2417,13 +2413,14 @@ def ingest_target(
 def live_status_map(snap: dict[str, Any]) -> dict[str, str]:
     """一份快照里所有主会话与卫星的 `platform:id → status`。"""
     live: dict[str, str] = {}
-    for spec in SOURCES:
-        for agent in snap.get(spec.key, []):
-            live[completion_key(spec.key, agent["id"])] = str(
+    for entry in snap.get("platforms", []):
+        platform = str(entry.get("key") or "")
+        for agent in entry.get("agents", []):
+            live[completion_key(platform, agent["id"])] = str(
                 agent.get("status") or ""
             )
             for satellite in agent.get("satellites", []):
-                live[completion_key(spec.key, satellite["id"])] = str(
+                live[completion_key(platform, satellite["id"])] = str(
                     satellite.get("status") or ""
                 )
     return live
@@ -2841,15 +2838,117 @@ codex_spec = SourceSpec(
 # 按 order 排好序声明；载荷里的先后就是这里的先后。
 SOURCES: list[SourceSpec] = [claude_spec, codex_spec]
 
+# 载荷的根键。平台不再拼进根上，但 key 撞名依然会让前端把平台当元数据读，
+# 所以在注册表建好的当场就查一次。
+RESERVED_PAYLOAD_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "generatedAt",
+        "version",
+        "sources",
+        "notifications",
+        "platforms",
+        "counts",
+    }
+)
+
+
+def check_source_keys(sources: list[SourceSpec]) -> None:
+    clash = sorted({spec.key for spec in sources} & RESERVED_PAYLOAD_KEYS)
+    if clash:
+        raise RuntimeError(f"数据源 key 与载荷根键冲突：{'、'.join(clash)}")
+
+
+check_source_keys(SOURCES)
+
+# 非原生平台（某个源顺手发现、自己没登记成 SourceSpec 的运行时）的展示元数据。
+# 键按载荷字段命名：label / order / kind / hint / dismissible / lockable /
+# emptyText，缺的字段走默认值。Phase 3 先留空，后续由运行时画像填。
+FAMILY_META: dict[str, dict[str, Any]] = {}
+
+DEFAULT_PLATFORM_META: dict[str, Any] = {
+    "label": "",
+    "order": 90,
+    "kind": "discovered",
+    "hint": "",
+    "dismissible": False,
+    "lockable": False,
+    "emptyText": "",
+}
+
 
 def source_for(platform: str) -> SourceSpec | None:
     return next((spec for spec in SOURCES if spec.key == platform), None)
+
+
+def platform_meta(key: str) -> dict[str, Any]:
+    """一个平台分区的展示元数据：先问原生注册表，再问家族表，最后兜底。"""
+    spec = source_for(key)
+    if spec is not None:
+        return {
+            "label": spec.label,
+            "order": spec.order,
+            "kind": spec.kind,
+            "hint": spec.hint,
+            "dismissible": spec.dismissible,
+            "lockable": spec.lockable,
+            "emptyText": spec.empty_text,
+        }
+    meta = dict(DEFAULT_PLATFORM_META)
+    meta["label"] = key.capitalize()
+    for field, value in (FAMILY_META.get(key) or {}).items():
+        if field in meta:
+            meta[field] = value
+    return meta
 
 
 def cost_mode_for(platform: str) -> str:
     """注册表登记的记账口径；没登记的平台按自己的 key 走老路径。"""
     spec = source_for(platform)
     return spec.cost_mode if spec is not None else platform
+
+
+def aggregate_platforms(
+    loaded: list[tuple[str, list[dict[str, Any]], dict[str, str]]],
+) -> list[dict[str, Any]]:
+    """把各来源交上来的灯按 `agent["platform"]` 归堆成分区。
+
+    一个来源可以交出好几个平台的灯（自动发现的运行时就挂在采它的那个源下），
+    所以分区不是按来源切的。健康度：原生平台永远用它自己那个源的，非原生平台
+    跟着最先产出它的来源走。原生平台哪怕一盏灯都没有也要出现，否则空态与
+    「数据源不可用」没有地方渲染。
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    health: dict[str, dict[str, str]] = {}
+    for source_key, agents, source_health in loaded:
+        for agent in agents:
+            key = str(agent.get("platform") or source_key)
+            grouped.setdefault(key, []).append(agent)
+            health.setdefault(key, source_health)
+    for source_key, _agents, source_health in loaded:
+        if source_for(source_key) is not None:
+            grouped.setdefault(source_key, [])
+            health[source_key] = source_health
+
+    platforms: list[dict[str, Any]] = []
+    for key, agents in grouped.items():
+        meta = platform_meta(key)
+        platforms.append(
+            {
+                "key": key,
+                "label": meta["label"],
+                "order": meta["order"],
+                "kind": meta["kind"],
+                "hint": meta["hint"],
+                "dismissible": meta["dismissible"],
+                "lockable": meta["lockable"],
+                "emptyText": meta["emptyText"],
+                "health": health.get(key) or {"state": "live", "detail": ""},
+                "agents": agents,
+            }
+        )
+    platforms.sort(key=lambda entry: (entry["order"], entry["key"]))
+    return platforms
 
 
 def snapshot(locked_codex_ids: set[str] | None = None) -> dict[str, Any]:
@@ -2859,33 +2958,39 @@ def snapshot(locked_codex_ids: set[str] | None = None) -> dict[str, Any]:
         "table": scan_processes(),
         "locked_ids": locked_codex_ids or set(),
     }
-    agents: dict[str, list[dict[str, Any]]] = {}
+    loaded: list[tuple[str, list[dict[str, Any]], dict[str, str]]] = []
     sources: dict[str, dict[str, str]] = {}
     for spec in SOURCES:
-        agents[spec.key], sources[spec.key] = spec.load(context)
+        agents, health = spec.load(context)
+        loaded.append((spec.key, agents, health))
+        sources[spec.key] = health
+    platforms = aggregate_platforms(loaded)
 
     prune_tracking(
         {
-            completion_key(spec.key, agent["id"])
-            for spec in SOURCES
-            for agent in agents[spec.key]
+            completion_key(entry["key"], agent["id"])
+            for entry in platforms
+            for agent in entry["agents"]
         }
     )
-    counts: dict[str, int] = {spec.key: len(agents[spec.key]) for spec in SOURCES}
-    counts["satellites"] = sum(
-        len(agent["satellites"])
-        for spec in SOURCES
-        for agent in agents[spec.key]
-    )
-    payload: dict[str, Any] = {
+    counts: dict[str, Any] = {
+        "agents": sum(len(entry["agents"]) for entry in platforms),
+        "satellites": sum(
+            len(agent["satellites"])
+            for entry in platforms
+            for agent in entry["agents"]
+        ),
+        "byPlatform": {entry["key"]: len(entry["agents"]) for entry in platforms},
+    }
+    return {
         "schemaVersion": SCHEMA_VERSION,
         "generatedAt": current_ms,
+        "version": APP_VERSION,
         "sources": sources,
         "notifications": dict(_notify_health),
+        "platforms": platforms,
+        "counts": counts,
     }
-    payload.update(agents)
-    payload["counts"] = counts
-    return payload
 
 
 def snapshot_revision(payload: dict[str, Any]) -> str:
@@ -2932,9 +3037,9 @@ def dispatch_notifications(payload: dict[str, Any]) -> list[str]:
     global _notify_primed
     current_ms = int(payload.get("generatedAt") or now_ms())
     agents = [
-        (spec.key, agent)
-        for spec in SOURCES
-        for agent in payload.get(spec.key, [])
+        (str(entry.get("key") or ""), agent)
+        for entry in payload.get("platforms", [])
+        for agent in entry.get("agents", [])
     ]
     interesting = [
         (platform, agent)
@@ -3161,14 +3266,35 @@ def open_codex(agent: dict[str, Any]) -> None:
         raise RuntimeError(result.stderr.strip() or "无法打开 Codex 任务")
 
 
+def platform_entry(payload: dict[str, Any], key: str) -> dict[str, Any] | None:
+    return next(
+        (
+            entry
+            for entry in payload.get("platforms", [])
+            if entry.get("key") == key
+        ),
+        None,
+    )
+
+
+def platform_is_known(key: str) -> bool:
+    """原生源永远受理；自动发现的平台只要出现在最近一轮载荷里就受理。"""
+    if source_for(key) is not None:
+        return True
+    with _snapshot_ready:
+        snap = _latest_snapshot
+    return platform_entry(snap or {}, key) is not None
+
+
 def find_agent(platform: str, agent_id: str) -> dict[str, Any] | None:
-    spec = source_for(platform)
-    if spec is None:
+    # 可锁定的平台要把这一条钉住，否则它可能刚好在这一轮被隐藏掉。
+    locked = {agent_id} if platform_meta(platform)["lockable"] else None
+    entry = platform_entry(snapshot(locked), platform)
+    if entry is None:
         return None
-    # 可锁定的源要把这一条钉住，否则它可能刚好在这一轮被隐藏掉。
-    locked = {agent_id} if spec.lockable else None
-    agents = snapshot(locked).get(platform, [])
-    return next((item for item in agents if item["id"] == agent_id), None)
+    return next(
+        (item for item in entry.get("agents", []) if item["id"] == agent_id), None
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -3298,16 +3424,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "请求格式错误"}, 400)
             return
 
-        spec = source_for(platform)
-        if spec is None:
+        if not platform_is_known(platform):
             self.send_json({"error": "未知平台"}, 400)
             return
         agent = find_agent(platform, agent_id)
         if not agent:
             self.send_json({"error": "会话已经离线"}, 404)
             return
+        # 只有原生源登记了 open 回调；自动发现的平台没有窗口可切，直接走确认分支。
+        spec = source_for(platform)
         opened = False
-        if agent.get("openable"):
+        if spec is not None and agent.get("openable"):
             try:
                 spec.open(agent)
             except (OSError, RuntimeError, subprocess.SubprocessError) as error:

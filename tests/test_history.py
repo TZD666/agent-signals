@@ -779,11 +779,12 @@ class HistoryEndpointTests(unittest.TestCase):
                 server, "CODEX_PRICES_PATH", self.root / "codex_prices.json"
             ),
             patch.object(server, "snapshot", return_value={
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "generatedAt": 1,
+                "version": server.APP_VERSION,
                 "sources": {}, "notifications": {},
-                "claude": [], "codex": [],
-                "counts": {"claude": 0, "codex": 0, "satellites": 0},
+                "platforms": [],
+                "counts": {"agents": 0, "satellites": 0, "byPlatform": {}},
             }),
             patch.object(server, "send_mac_notification"),
         ]
@@ -862,8 +863,8 @@ class HistoryEndpointTests(unittest.TestCase):
         self.assertEqual(
             set(body.keys()),
             {
-                "schemaVersion", "generatedAt", "sources", "notifications",
-                "claude", "codex", "counts",
+                "schemaVersion", "generatedAt", "version", "sources",
+                "notifications", "platforms", "counts",
             },
         )
         self.assertNotIn("cost", json.dumps(body))
