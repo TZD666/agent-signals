@@ -508,7 +508,8 @@ h2 {
   letter-spacing: -0.018em;
 }
 
-h2 span {
+/* 分区标题里的平台名走正文色，只有后面那句提示是灰的副标题。 */
+h2 .platform-hint {
   color: #686f79;
   font-weight: 430;
 }
@@ -1102,7 +1103,7 @@ footer p {
   color: #8993a2;
 }
 
-:root[data-theme="light"] h2 span,
+:root[data-theme="light"] h2 .platform-hint,
 :root[data-theme="light"] .section-heading > p {
   color: #697486;
 }

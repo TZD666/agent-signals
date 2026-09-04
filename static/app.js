@@ -1,4 +1,4 @@
-const SUPPORTED_SCHEMA = 1;
+const SUPPORTED_SCHEMA = 2;
 
 const STATUS_LABELS = {
   idle: "空闲",
@@ -9,7 +9,6 @@ const STATUS_LABELS = {
   error: "错误",
 };
 
-const SOURCE_LABELS = { claude: "Claude", codex: "Codex" };
 const SOURCE_STATE_LABELS = {
   live: "正常",
   unavailable: "数据源不可用",
@@ -25,17 +24,23 @@ const POLL_WAIT_S = 8;
 const POLL_FLOOR_MS = 250;
 const BACKOFF_MAX_MS = 15000;
 
-const grids = {
-  claude: document.querySelector("#claudeGrid"),
-  codex: document.querySelector("#codexGrid"),
-};
+// 分区不再写死在 HTML 里：模板给形状，载荷里的 platforms 决定有哪些、什么顺序。
+const platformsRoot = document.querySelector("#platforms");
+const platformTemplate = document.querySelector("#platformSection");
+const sections = new Map();
 
 const STORAGE_KEYS = {
   acknowledged: "agent-signals.acknowledged-completions",
-  dismissedCodex: "agent-signals.dismissed-codex",
-  lockedCodex: "agent-signals.locked-codex",
   theme: "agent-signals.theme",
   historyOpen: "agent-signals.history-open",
+  schemaReload: "agent-signals.schema-reload",
+};
+
+// 隐藏与锁定曾经只有 Codex 一个平台，键名把平台写死了；现在一平台一桶，
+// 老键启动时搬进 codex 桶后删掉。
+const LEGACY_STORAGE_KEYS = {
+  dismissed: "agent-signals.dismissed-codex",
+  locked: "agent-signals.locked-codex",
 };
 
 const HISTORY_REFRESH_MS = 30000;
@@ -46,7 +51,7 @@ let toastTimer;
 let pollTimer;
 let backoff = 1000;
 let etag = "";
-let latestData = { claude: [], codex: [] };
+let latestData = { platforms: [] };
 let audioContext = null;
 let audioUnlocked = false;
 let pendingFlash = new Set();
@@ -69,8 +74,8 @@ function readStoredSet(key) {
 }
 
 const acknowledgedCompletions = readStoredObject(STORAGE_KEYS.acknowledged);
-const dismissedCodex = readStoredSet(STORAGE_KEYS.dismissedCodex);
-const lockedCodex = readStoredSet(STORAGE_KEYS.lockedCodex);
+const dismissedBuckets = new Map();
+const lockedBuckets = new Map();
 
 function storeObject(key, value) {
   try {
@@ -82,6 +87,59 @@ function storeObject(key, value) {
 
 function storeSet(key, value) {
   storeObject(key, [...value]);
+}
+
+function bucketStorageKey(kind, platform) {
+  return `agent-signals.${kind}.${platform}`;
+}
+
+function bucketFor(kind, platform) {
+  const store = kind === "locked" ? lockedBuckets : dismissedBuckets;
+  let ids = store.get(platform);
+  if (!ids) {
+    ids = readStoredSet(bucketStorageKey(kind, platform));
+    store.set(platform, ids);
+  }
+  return ids;
+}
+
+function saveBucket(kind, platform) {
+  storeSet(bucketStorageKey(kind, platform), bucketFor(kind, platform));
+}
+
+function migrateLegacyBuckets() {
+  for (const [kind, legacyKey] of Object.entries(LEGACY_STORAGE_KEYS)) {
+    let raw = null;
+    try {
+      raw = localStorage.getItem(legacyKey);
+    } catch {
+      return;
+    }
+    if (raw === null) continue;
+    const ids = bucketFor(kind, "codex");
+    for (const id of readStoredSet(legacyKey)) ids.add(id);
+    saveBucket(kind, "codex");
+    try {
+      localStorage.removeItem(legacyKey);
+    } catch {
+      // 老键删不掉也不要紧，这次迁移是幂等的。
+    }
+  }
+}
+
+function loadStoredBuckets() {
+  // 首个 ?locked= 请求发生在第一次渲染之前，所以桶要在开跑前全部读进来。
+  try {
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index) || "";
+      for (const kind of ["dismissed", "locked"]) {
+        const prefix = `agent-signals.${kind}.`;
+        if (key.startsWith(prefix)) bucketFor(kind, key.slice(prefix.length));
+      }
+    }
+  } catch {
+    // 没有本地存储就当没有隐藏与锁定记录。
+  }
 }
 
 function applyTheme(theme, persist = false) {
@@ -176,11 +234,11 @@ function loadMarkup(agent) {
 }
 
 function patchLoads(visible) {
-  for (const platform of ["claude", "codex"]) {
-    for (const agent of visible[platform]) {
+  for (const { platform, agents } of visible) {
+    for (const agent of agents) {
       if (!agent.load || typeof agent.load !== "object") continue;
       const card = document.querySelector(
-        `.agent-card[data-platform="${CSS.escape(platform)}"][data-agent-id="${CSS.escape(agent.id)}"]`,
+        `.agent-card[data-platform="${CSS.escape(platform.key)}"][data-agent-id="${CSS.escape(agent.id)}"]`,
       );
       const element = card?.querySelector(".agent-load");
       if (!element || element.dataset.loadSig === loadSig(agent.load)) continue;
@@ -223,49 +281,50 @@ function effectiveStatus(platform, agent) {
 function effectiveAgent(platform, agent) {
   return {
     ...agent,
-    status: effectiveStatus(platform, agent),
+    status: effectiveStatus(platform.key, agent),
     satellites: (agent.satellites || []).map((satellite) => ({
       ...satellite,
-      status: effectiveStatus(platform, satellite),
+      status: effectiveStatus(platform.key, satellite),
     })),
-    isLocked: platform === "codex" && lockedCodex.has(agent.id),
+    isLocked:
+      platform.lockable === true && bucketFor("locked", platform.key).has(agent.id),
   };
 }
 
 function visibleAgents(platform, agents) {
+  if (!platform.dismissible) {
+    return agents.map((agent) => effectiveAgent(platform, agent));
+  }
+  const dismissed = bucketFor("dismissed", platform.key);
   let preferencesChanged = false;
   const visible = [];
 
   for (const rawAgent of agents) {
     const agent = effectiveAgent(platform, rawAgent);
-    if (platform === "codex" && agent.status !== "idle") {
-      if (dismissedCodex.delete(agent.id)) preferencesChanged = true;
-    }
-    if (
-      platform === "codex" &&
-      agent.status === "idle" &&
-      (dismissedCodex.has(agent.id) ||
-        (!agent.isLocked && Date.now() - Number(agent.updatedAt) >= DAY_MS))
+    if (agent.status !== "idle") {
+      if (dismissed.delete(agent.id)) preferencesChanged = true;
+    } else if (
+      dismissed.has(agent.id) ||
+      (!agent.isLocked && Date.now() - Number(agent.updatedAt) >= DAY_MS)
     ) {
       continue;
     }
     visible.push(agent);
   }
 
-  if (preferencesChanged) {
-    storeSet(STORAGE_KEYS.dismissedCodex, dismissedCodex);
-  }
+  if (preferencesChanged) saveBucket("dismissed", platform.key);
   return visible;
 }
 
-function cardMarkup(agent) {
+function cardMarkup(agent, platform) {
   const status = STATUS_LABELS[agent.status] || agent.status;
   const note = durationNote(agent);
   // 打不开的灯（headless 的 claude -p）转绿之后还剩一件事能做：确认掉它。
   const canAcknowledge = !agent.openable && agent.status === "completed";
-  const showIdleControls = agent.platform === "codex" && agent.status === "idle";
-  const controls = showIdleControls
-    ? `
+  const idle = agent.status === "idle";
+  const lockControl =
+    idle && platform.lockable
+      ? `
       <button
         class="agent-control agent-lock${agent.isLocked ? " is-locked" : ""}"
         type="button"
@@ -273,7 +332,11 @@ function cardMarkup(agent) {
         data-agent-id="${escapeHtml(agent.id)}"
         aria-label="${agent.isLocked ? "取消锁定" : "锁定"} ${escapeHtml(agent.name)}"
         title="${agent.isLocked ? "取消锁定，24 小时后可自动隐藏" : "锁定，超过 24 小时仍显示"}"
-      >🔒</button>
+      >🔒</button>`
+      : "";
+  const dismissControl =
+    idle && platform.dismissible
+      ? `
       <button
         class="agent-control agent-dismiss"
         type="button"
@@ -282,12 +345,14 @@ function cardMarkup(agent) {
         aria-label="隐藏 ${escapeHtml(agent.name)}"
         title="关闭显示"
       >×</button>`
-    : "";
+      : "";
+  const controls = `${lockControl}${dismissControl}`;
   return `
     <article
       class="agent-card status-${escapeHtml(agent.status)}"
-      data-platform="${escapeHtml(agent.platform)}"
+      data-platform="${escapeHtml(platform.key)}"
       data-agent-id="${escapeHtml(agent.id)}"
+      data-origin="${escapeHtml(agent.origin || "")}"
     >
       ${controls}
       <button
@@ -320,7 +385,8 @@ function cardMarkup(agent) {
     </article>`;
 }
 
-function emptyMarkup(platform, health) {
+function emptyMarkup(platform) {
+  const health = platform.health;
   if (health && health.state && health.state !== "live") {
     const label = SOURCE_STATE_LABELS[health.state] || health.state;
     return `
@@ -335,8 +401,57 @@ function emptyMarkup(platform, health) {
   return `
     <div class="empty-state">
       <span class="empty-orb"></span>
-      <p>没有检测到${platform === "claude" ? "前台 Terminal 会话" : "近期 Codex 任务"}</p>
+      <p>${escapeHtml(platform.emptyText || "没有检测到运行中的会话")}</p>
     </div>`;
+}
+
+function sectionFor(key) {
+  let entry = sections.get(key);
+  if (!entry) {
+    const node = platformTemplate.content.firstElementChild.cloneNode(true);
+    entry = {
+      section: node,
+      index: node.querySelector(".platform-index"),
+      label: node.querySelector(".platform-label"),
+      hint: node.querySelector(".platform-hint"),
+      count: node.querySelector(".platform-count"),
+      grid: node.querySelector(".agent-grid"),
+    };
+    sections.set(key, entry);
+  }
+  return entry;
+}
+
+function syncSections(platforms) {
+  const alive = new Set();
+  platforms.forEach((platform, position) => {
+    alive.add(platform.key);
+    const entry = sectionFor(platform.key);
+    const label = platform.label || platform.key;
+    entry.section.dataset.platform = platform.key;
+    entry.section.setAttribute("aria-label", label);
+    entry.index.textContent = String(position + 1).padStart(2, "0");
+    entry.label.textContent = label;
+    entry.hint.textContent = platform.hint ? `· ${platform.hint}` : "";
+    // 重新 append 已在文档里的节点＝移动它，顺序永远跟着载荷。
+    platformsRoot.appendChild(entry.section);
+  });
+  for (const [key, entry] of sections) {
+    if (alive.has(key)) continue;
+    entry.section.remove();
+    sections.delete(key);
+  }
+}
+
+function platformByKey(key) {
+  return (latestData.platforms || []).find((platform) => platform.key === key);
+}
+
+function platformLabel(key) {
+  const platform = platformByKey(key);
+  if (platform?.label) return platform.label;
+  const text = String(key || "");
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : "";
 }
 
 function showBanner(message) {
@@ -350,16 +465,15 @@ function hideBanner() {
 }
 
 function renderSources(data) {
-  const sources = data.sources || {};
   const parts = [];
 
-  for (const platform of ["claude", "codex"]) {
-    const health = sources[platform] || { state: "unknown", detail: "" };
+  for (const platform of data.platforms || []) {
+    const health = platform.health || { state: "unknown", detail: "" };
     const live = health.state === "live";
     const label = SOURCE_STATE_LABELS[health.state] || health.state;
     parts.push(`
       <span class="source ${live ? "is-live" : "is-down"}" title="${escapeHtml(health.detail || label)}">
-        <i class="source-dot"></i>${escapeHtml(SOURCE_LABELS[platform])} · ${escapeHtml(label)}
+        <i class="source-dot"></i>${escapeHtml(platform.label || platform.key)} · ${escapeHtml(label)}
       </span>`);
   }
 
@@ -412,9 +526,9 @@ function playChime(kind) {
 }
 
 function updateTitle(visible) {
-  const alerts = [...visible.claude, ...visible.codex].filter((agent) =>
-    ALERT_STATUSES.has(agent.status),
-  );
+  const alerts = visible
+    .flatMap((entry) => entry.agents)
+    .filter((agent) => ALERT_STATUSES.has(agent.status));
   if (!alerts.length) {
     document.title = "Agent Signals";
     return;
@@ -431,9 +545,9 @@ function handleAlerts(visible) {
   let done = false;
   const flash = new Set();
 
-  for (const platform of ["claude", "codex"]) {
-    for (const agent of visible[platform]) {
-      const key = `${platform}:${agent.id}`;
+  for (const { platform, agents } of visible) {
+    for (const agent of agents) {
+      const key = `${platform.key}:${agent.id}`;
       live.add(key);
       const before = previousStatus.get(key);
       previousStatus.set(key, agent.status);
@@ -478,6 +592,18 @@ function applyFlash() {
   pendingFlash = new Set();
 }
 
+function reloadOncePerTab() {
+  // iPad 主屏 PWA 会把旧 app.js 常驻，横幅之后再自动刷一次让新脚本进来；
+  // sessionStorage 守着，一个标签页最多刷这一次，刷不进去就只剩横幅。
+  try {
+    if (sessionStorage.getItem(STORAGE_KEYS.schemaReload)) return;
+    sessionStorage.setItem(STORAGE_KEYS.schemaReload, "1");
+  } catch {
+    return;
+  }
+  location.reload();
+}
+
 function render(data) {
   latestData = data;
 
@@ -485,24 +611,28 @@ function render(data) {
     showBanner(
       `面板不认识这个数据格式（schemaVersion ${data.schemaVersion}），已停止渲染以免显示错误状态。请更新面板。`,
     );
-    grids.claude.innerHTML = "";
-    grids.codex.innerHTML = "";
+    for (const entry of sections.values()) entry.grid.innerHTML = "";
+    reloadOncePerTab();
     return;
   }
   hideBanner();
 
-  const sources = data.sources || {};
-  const visible = {
-    claude: visibleAgents("claude", data.claude || []),
-    codex: visibleAgents("codex", data.codex || []),
-  };
+  const platforms = Array.isArray(data.platforms) ? data.platforms : [];
+  const visible = platforms.map((platform) => ({
+    platform,
+    agents: visibleAgents(platform, platform.agents || []),
+  }));
 
   // Load values churn during every turn; keep them out of the rebuild
   // signature and patch them in place so orbit animations keep their phase.
   const stripLoad = (agents) => agents.map(({ load, ...rest }) => rest);
   const signature = JSON.stringify({
-    visible: { claude: stripLoad(visible.claude), codex: stripLoad(visible.codex) },
-    sources,
+    platforms: visible.map(({ platform, agents }) => ({
+      key: platform.key,
+      health: platform.health,
+      agents: stripLoad(agents),
+    })),
+    sources: data.sources,
     notifications: data.notifications,
     audioUnlocked,
   });
@@ -524,12 +654,13 @@ function render(data) {
   handleAlerts(visible);
   updateTitle(visible);
 
-  for (const platform of ["claude", "codex"]) {
-    const agents = visible[platform];
-    grids[platform].innerHTML = agents.length
-      ? agents.map(cardMarkup).join("")
-      : emptyMarkup(platform, sources[platform]);
-    document.querySelector(`#${platform}Count`).textContent = agents.length;
+  syncSections(platforms);
+  for (const { platform, agents } of visible) {
+    const entry = sectionFor(platform.key);
+    entry.grid.innerHTML = agents.length
+      ? agents.map((agent) => cardMarkup(agent, platform)).join("")
+      : emptyMarkup(platform);
+    entry.count.textContent = agents.length;
   }
 
   applyFlash();
@@ -553,7 +684,9 @@ async function poll() {
   if (document.hidden) return;
   try {
     const query = new URLSearchParams();
-    for (const id of lockedCodex) query.append("locked", id);
+    for (const ids of lockedBuckets.values()) {
+      for (const id of ids) query.append("locked", id);
+    }
     query.set("wait", String(POLL_WAIT_S));
     const response = await fetch(`/api/agents?${query}`, {
       cache: "no-store",
@@ -589,8 +722,9 @@ function showToast(message, isError = false) {
   toastTimer = setTimeout(() => toast.classList.remove("visible"), 2600);
 }
 
-function findRawAgent(platform, id) {
-  return (latestData[platform] || []).find((agent) => agent.id === id);
+function findRawAgent(platformKey, id) {
+  const platform = platformByKey(platformKey);
+  return (platform?.agents || []).find((agent) => agent.id === id);
 }
 
 function acknowledgeCompleted(agent, platform) {
@@ -645,28 +779,34 @@ async function openAgent(button) {
   }
 }
 
-function toggleLock(id) {
-  const agent = findRawAgent("codex", id);
-  if (!agent || effectiveStatus("codex", agent) !== "idle") return;
-  const isLocked = lockedCodex.has(id);
+function toggleLock(platformKey, id) {
+  const platform = platformByKey(platformKey);
+  if (!platform?.lockable) return;
+  const agent = findRawAgent(platformKey, id);
+  if (!agent || effectiveStatus(platformKey, agent) !== "idle") return;
+  const locked = bucketFor("locked", platformKey);
+  const isLocked = locked.has(id);
   if (isLocked) {
-    lockedCodex.delete(id);
+    locked.delete(id);
   } else {
-    lockedCodex.add(id);
-    dismissedCodex.delete(id);
-    storeSet(STORAGE_KEYS.dismissedCodex, dismissedCodex);
+    locked.add(id);
+    if (bucketFor("dismissed", platformKey).delete(id)) {
+      saveBucket("dismissed", platformKey);
+    }
   }
-  storeSet(STORAGE_KEYS.lockedCodex, lockedCodex);
+  saveBucket("locked", platformKey);
   snapshotSignature = "";
   render(latestData);
   showToast(isLocked ? "已取消锁定" : "已锁定，24 小时后仍会显示");
 }
 
-function dismissAgent(id) {
-  dismissedCodex.add(id);
-  lockedCodex.delete(id);
-  storeSet(STORAGE_KEYS.dismissedCodex, dismissedCodex);
-  storeSet(STORAGE_KEYS.lockedCodex, lockedCodex);
+function dismissAgent(platformKey, id) {
+  const platform = platformByKey(platformKey);
+  if (!platform?.dismissible) return;
+  bucketFor("dismissed", platformKey).add(id);
+  bucketFor("locked", platformKey).delete(id);
+  saveBucket("dismissed", platformKey);
+  saveBucket("locked", platformKey);
   snapshotSignature = "";
   render(latestData);
   showToast("已关闭这个空闲任务的显示");
@@ -769,7 +909,7 @@ function historyRowMarkup(session) {
       <span class="history-main">
         <span class="history-dot status-${escapeHtml(session.status || "idle")}"></span>
         <span class="history-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
-        <span class="history-tag">${session.platform === "claude" ? "Claude" : "Codex"}</span>
+        <span class="history-tag">${escapeHtml(platformLabel(session.platform))}</span>
         <span class="history-tag">${escapeHtml(statusLabel)}</span>
         ${costMarkup(session)}
       </span>
@@ -931,12 +1071,13 @@ document.addEventListener("click", (event) => {
     toggleHistoryDetail(control.dataset.sessionKey);
     return;
   }
-  if (control?.dataset.action === "lock") {
-    toggleLock(control.dataset.agentId);
-    return;
-  }
-  if (control?.dataset.action === "dismiss") {
-    dismissAgent(control.dataset.agentId);
+  if (control?.dataset.action === "lock" || control?.dataset.action === "dismiss") {
+    const platformKey = control.closest(".agent-card")?.dataset.platform || "";
+    if (control.dataset.action === "lock") {
+      toggleLock(platformKey, control.dataset.agentId);
+    } else {
+      dismissAgent(platformKey, control.dataset.agentId);
+    }
     return;
   }
   const button = event.target.closest(".agent-open");
@@ -980,6 +1121,8 @@ setInterval(() => {
   });
 }, 1000);
 
+migrateLegacyBuckets();
+loadStoredBuckets();
 applyTheme(document.documentElement.dataset.theme);
 try {
   if (localStorage.getItem(STORAGE_KEYS.historyOpen) === "1") {

@@ -91,11 +91,38 @@
 
 `agent-history.db`、`codex_prices.json`、`.agent-signals-state.json`、`runtime-profiles.json` 是运行时数据，脚本永远不覆盖它们。运行目录默认 `~/Library/Application Support/AgentSignals`，可用 `AGENT_SIGNALS_DEPLOY_DIR` 覆盖。
 
+## 平台分区与载荷（schemaVersion 2）
+
+`/api/agents` 的载荷不再让每个数据源占一个根键（老的 `claude` / `codex` 两个数组已删除），改成一个 `platforms` 列表：
+
+```
+{
+  "schemaVersion": 2, "generatedAt": …, "version": "2.2.0",
+  "sources":       { "<源 key>": {state, detail} },      // 采集端健康度，按来源
+  "notifications": {state, detail},
+  "platforms": [
+    { "key", "label", "order", "kind", "hint",
+      "dismissible", "lockable", "emptyText",
+      "health": {state, detail},
+      "agents": [ …这个平台的灯… ] }
+  ],
+  "counts": { "agents": N, "satellites": M, "byPlatform": {"<平台 key>": n} }
+}
+```
+
+分区按 **`agent["platform"]` 归堆**，不是按来源切：一个来源可以交出好几个平台的灯（自动发现的运行时就挂在采到它的那个源下）。排序按 `(order, key)`。每个分区的展示元数据来自 `platform_meta()`——先问原生 `SOURCES`（label / order / kind / hint / dismissible / lockable / empty_text 都在 `SourceSpec` 上），再问 `FAMILY_META`（自动发现的家族表，Phase 3 先留空），最后兜底成 `{label: key 首字母大写, order: 90, kind: "discovered"}`。原生平台**即使一盏灯都没有也会出现**，否则它的空态与「数据源不可用」没有地方渲染；非原生平台只在有灯时出现，健康度跟着产出它的那个来源走。源 key 与载荷根键撞名会在注册表建好的当场抛错（`check_source_keys`）。
+
+`/api/open` 的平台白名单也跟着放宽：只要平台出现在最近一轮载荷里就受理；没有登记 `open` 回调的平台（自动发现的那些）不打开任何窗口，只走确认分支，返回 `{"ok": true, "opened": false, …}`。
+
+前端相应地不再把分区写死在 HTML 里：`static/index.html` 只留一个 `<div id="platforms">` 和一份 `<template id="platformSection">`，`app.js` 按 `data.platforms` 惰性克隆出分区、平台消失就整块移除，序号 `01/02/03…` 是排序后的位次。🔒 / × 两个按钮由 `lockable` / `dismissible` 决定，空态文案取 `emptyText`，历史面板的平台标签取 `label`。重建签名只包含 `{key, health, 剔掉 load 的可见灯}`，签名不变就只给负载条打补丁，卡片 DOM 不重建（轨道动画相位靠这个）。
+
+隐藏与锁定的浏览器存储从写死平台的 `agent-signals.dismissed-codex` / `agent-signals.locked-codex` 改成一平台一桶的 `agent-signals.dismissed.<平台 key>` / `agent-signals.locked.<平台 key>`，老键在启动时搬进 `codex` 桶后删除（幂等）。
+
 ## 数据源健康度
 
 面板绝不把"读不到数据"显示成"没有任务"。顶部有一条数据源状态，取值 `正常 / 数据源不可用 / 数据结构已变`；某个源不可用时，该区域渲染灰斜纹提示并写明原因，而不是空态。
 
-Codex 数据库不再硬编码版本号：默认在 `~/.codex/` 下挑版本号最大的 `state_*.sqlite`，并校验 `threads` 表字段；字段对不上时报 `数据结构已变` 而不是静默返回空。载荷带 `schemaVersion`，前端遇到不认识的版本会停止渲染并显示横幅，而不是猜。
+Codex 数据库不再硬编码版本号：默认在 `~/.codex/` 下挑版本号最大的 `state_*.sqlite`，并校验 `threads` 表字段；字段对不上时报 `数据结构已变` 而不是静默返回空。载荷带 `schemaVersion`，前端遇到不认识的版本会停止渲染并显示横幅，而不是猜；横幅之外还会自动刷新一次页面（`sessionStorage` 守着，一个标签页最多一次），因为 iPad 主屏 PWA 会把旧 `app.js` 常驻，光有横幅等不来新脚本。
 
 Codex 写端不在线且 WAL 上次未干净收尾时，纯只读打开会失败（读端建不了 `-shm`，报 `unable to open database file`；2026-08-18 ChatGPT 桌面端升级中断写端时实测踩到）。面板会自动退回 `immutable` 模式读取——此时写端必然离线，不存在脏读；写端回来后 `-shm` 重建，主路径自动恢复。
 
@@ -151,7 +178,7 @@ Codex 数据库会同时从 `~/.codex/` 与 `~/.codex/sqlite/` 探测，并优�
 
 ## 其他
 
-Codex 空闲任务可用右上角的 × 手动隐藏，并会在空闲 24 小时后自动隐藏；点击左上角的 🔒 锁定后可持续保留。隐藏与锁定状态保存在当前浏览器中。
+标了 `dismissible` 的平台（今天只有 Codex），空闲任务可用右上角的 × 手动隐藏，并会在空闲 24 小时后自动隐藏；标了 `lockable` 的平台，点击左上角的 🔒 锁定后可持续保留。隐藏与锁定状态按平台分桶保存在当前浏览器中。
 
 页面右上角可切换暗色与亮色模式，主题选择同样会保存在当前浏览器中。
 

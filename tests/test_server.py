@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 import os
@@ -782,16 +783,21 @@ class NotificationTests(unittest.TestCase):
     def payload(self, status="needs_input", agent_id="a1"):
         return {
             "generatedAt": 1_000_000,
-            "claude": [
+            "platforms": [
                 {
-                    "id": agent_id,
-                    "name": "edy-d6",
-                    "status": status,
-                    "cwdLabel": "项目",
-                    "completionId": 0,
-                }
+                    "key": "claude",
+                    "agents": [
+                        {
+                            "id": agent_id,
+                            "name": "edy-d6",
+                            "status": status,
+                            "cwdLabel": "项目",
+                            "completionId": 0,
+                        }
+                    ],
+                },
+                {"key": "codex", "agents": []},
             ],
-            "codex": [],
         }
 
     def test_same_state_notifies_once(self):
@@ -1283,6 +1289,50 @@ GOLDEN_CODEX_HEALTH = {"state": "live", "detail": "兼容读取"}
 GOLDEN_NOTIFY_HEALTH = {"state": "ok", "detail": ""}
 
 
+def make_spec(key, agents, health=None, **overrides):
+    """一个只把手里这批 agent 原样交出来的假数据源。"""
+    fields = {
+        "key": key,
+        "label": key.title(),
+        "order": 0,
+        "kind": "local",
+        "load": lambda _ctx, payload=(agents, health or {"state": "live", "detail": ""}): payload,
+        "open": lambda _agent: None,
+        "history_targets": lambda: [],
+        "cost_mode": key,
+        "cost_label": "估算",
+        "dismissible": False,
+        "lockable": False,
+        "hint": "",
+        "empty_text": "",
+    }
+    fields.update(overrides)
+    return server.SourceSpec(**fields)
+
+
+def make_agent(agent_id, platform, status="idle", satellites=None):
+    return {
+        "id": agent_id,
+        "platform": platform,
+        "name": agent_id,
+        "status": status,
+        "cwdLabel": "项目",
+        "openable": True,
+        "completionId": 0,
+        "origin": "registry",
+        "satellites": satellites or [],
+    }
+
+
+def take_snapshot(sources, locked=None):
+    with patch.object(
+        server, "scan_processes", return_value=dict(EMPTY_TABLE)
+    ), patch.object(server, "SOURCES", sources), patch.object(
+        server, "_notify_health", dict(GOLDEN_NOTIFY_HEALTH)
+    ):
+        return server.snapshot(locked)
+
+
 class SnapshotPayloadTests(unittest.TestCase):
     """载荷是 iPad 前端的契约：重构可以动内部，不许动这张表。"""
 
@@ -1302,97 +1352,271 @@ class SnapshotPayloadTests(unittest.TestCase):
         ):
             return server.snapshot(locked)
 
-    def test_snapshot_payload_is_schema1_golden(self):
+    def test_snapshot_payload_is_schema2_golden(self):
         payload = self.take({"thread-1"})
         self.assertIsInstance(payload.pop("generatedAt"), int)
         self.assertEqual(
             payload,
             {
-                "schemaVersion": 1,
+                "schemaVersion": 2,
+                "version": server.APP_VERSION,
                 "sources": {
                     "claude": {"state": "live", "detail": ""},
                     "codex": {"state": "live", "detail": "兼容读取"},
                 },
                 "notifications": {"state": "ok", "detail": ""},
-                "claude": [
+                "platforms": [
                     {
-                        "id": "sid-1",
-                        "platform": "claude",
-                        "name": "edy-d6",
-                        "status": "thinking",
-                        "pid": 4242,
-                        "cwdLabel": "项目",
-                        "openable": True,
-                        "completionId": 0,
-                        "satellites": [
+                        "key": "claude",
+                        "label": "Claude Code",
+                        "order": 0,
+                        "kind": "local",
+                        "hint": "终端里的 Claude Code 会话",
+                        "dismissible": False,
+                        "lockable": False,
+                        "emptyText": "没有正在运行的 Claude 会话",
+                        "health": {"state": "live", "detail": ""},
+                        "agents": [
                             {
-                                "id": "sid-1/agent-a",
-                                "name": "Explore",
+                                "id": "sid-1",
+                                "platform": "claude",
+                                "name": "edy-d6",
                                 "status": "thinking",
+                                "pid": 4242,
+                                "cwdLabel": "项目",
+                                "openable": True,
+                                "completionId": 0,
+                                "satellites": [
+                                    {
+                                        "id": "sid-1/agent-a",
+                                        "name": "Explore",
+                                        "status": "thinking",
+                                    },
+                                    {
+                                        "id": "sid-1/agent-b",
+                                        "name": "Plan",
+                                        "status": "completed",
+                                    },
+                                ],
                             },
                             {
-                                "id": "sid-1/agent-b",
-                                "name": "Plan",
+                                "id": "sid-2",
+                                "platform": "claude",
+                                "name": "edy-d7",
+                                "status": "needs_input",
+                                "pid": 4243,
+                                "cwdLabel": "另一个项目",
+                                "openable": True,
+                                "completionId": 3,
+                                "satellites": [],
+                            },
+                        ],
+                    },
+                    {
+                        "key": "codex",
+                        "label": "Codex",
+                        "order": 1,
+                        "kind": "local",
+                        "hint": "Codex Desktop 的任务",
+                        "dismissible": True,
+                        "lockable": True,
+                        "emptyText": "没有正在运行的 Codex 任务",
+                        "health": {"state": "live", "detail": "兼容读取"},
+                        "agents": [
+                            {
+                                "id": "thread-1",
+                                "platform": "codex",
+                                "name": "Codex",
                                 "status": "completed",
-                            },
-                        ],
-                    },
-                    {
-                        "id": "sid-2",
-                        "platform": "claude",
-                        "name": "edy-d7",
-                        "status": "needs_input",
-                        "pid": 4243,
-                        "cwdLabel": "另一个项目",
-                        "openable": True,
-                        "completionId": 3,
-                        "satellites": [],
-                    },
-                ],
-                "codex": [
-                    {
-                        "id": "thread-1",
-                        "platform": "codex",
-                        "name": "Codex",
-                        "status": "completed",
-                        "cwdLabel": "项目",
-                        "openable": True,
-                        "completionId": 1,
-                        "satellites": [
-                            {
-                                "id": "thread-2",
-                                "name": "子代理",
-                                "status": "thinking",
+                                "cwdLabel": "项目",
+                                "openable": True,
+                                "completionId": 1,
+                                "satellites": [
+                                    {
+                                        "id": "thread-2",
+                                        "name": "子代理",
+                                        "status": "thinking",
+                                    },
+                                ],
                             },
                         ],
                     },
                 ],
-                "counts": {"claude": 2, "codex": 1, "satellites": 3},
+                "counts": {
+                    "agents": 3,
+                    "satellites": 3,
+                    "byPlatform": {"claude": 2, "codex": 1},
+                },
             },
         )
 
     def test_revision_stable_across_identical_samples(self):
         first = self.take()
-        second = self.take()
+        second = copy.deepcopy(self.take())
         second["generatedAt"] = first["generatedAt"] + 5_000
         self.assertEqual(
             server.snapshot_revision(first), server.snapshot_revision(second)
         )
 
 
+class PlatformAggregationTests(unittest.TestCase):
+    """一个来源可以交出多个平台的灯；分区按平台归堆，不按来源。"""
+
+    def sources(self):
+        # claude 源顺手交出一盏别处发现的 gemini 灯，codex 源也往 claude 里塞一盏。
+        return [
+            make_spec(
+                "claude",
+                [make_agent("sid-1", "claude"), make_agent("g-1", "gemini")],
+                {"state": "live", "detail": "本机"},
+                label="Claude Code",
+                order=0,
+            ),
+            make_spec(
+                "codex",
+                [make_agent("sid-2", "claude")],
+                {"state": "unavailable", "detail": "数据库不在"},
+                label="Codex",
+                order=1,
+            ),
+        ]
+
+    def test_platforms_sorted_by_order_and_aggregated_by_key(self):
+        payload = take_snapshot(self.sources())
+        self.assertEqual(
+            [entry["key"] for entry in payload["platforms"]],
+            ["claude", "codex", "gemini"],
+        )
+        claude = payload["platforms"][0]
+        self.assertEqual(
+            [agent["id"] for agent in claude["agents"]], ["sid-1", "sid-2"]
+        )
+        # 原生平台的健康度永远来自它自己的源，哪怕别的源也往里投了灯。
+        self.assertEqual(claude["health"], {"state": "live", "detail": "本机"})
+        self.assertEqual(
+            payload["platforms"][1]["health"],
+            {"state": "unavailable", "detail": "数据库不在"},
+        )
+        gemini = payload["platforms"][2]
+        self.assertEqual(
+            gemini,
+            {
+                "key": "gemini",
+                "label": "Gemini",
+                "order": 90,
+                "kind": "discovered",
+                "hint": "",
+                "dismissible": False,
+                "lockable": False,
+                "emptyText": "",
+                # 非原生平台跟着产出它的那个源的健康度走。
+                "health": {"state": "live", "detail": "本机"},
+                "agents": [make_agent("g-1", "gemini")],
+            },
+        )
+
+    def test_counts_by_platform(self):
+        payload = take_snapshot(self.sources())
+        self.assertEqual(
+            payload["counts"],
+            {
+                "agents": 3,
+                "satellites": 0,
+                "byPlatform": {"claude": 2, "codex": 0, "gemini": 1},
+            },
+        )
+
+    def test_native_platform_present_with_zero_agents(self):
+        payload = take_snapshot(
+            [
+                make_spec("claude", [], label="Claude Code", order=0),
+                make_spec(
+                    "codex",
+                    [],
+                    {"state": "schema_mismatch", "detail": "字段对不上"},
+                    label="Codex",
+                    order=1,
+                ),
+            ]
+        )
+        # 没有灯也要出分区，否则空态与"数据源不可用"根本没地方渲染。
+        self.assertEqual(
+            [entry["key"] for entry in payload["platforms"]], ["claude", "codex"]
+        )
+        self.assertEqual(payload["platforms"][1]["agents"], [])
+        self.assertEqual(
+            payload["platforms"][1]["health"],
+            {"state": "schema_mismatch", "detail": "字段对不上"},
+        )
+        self.assertEqual(payload["counts"]["byPlatform"], {"claude": 0, "codex": 0})
+
+    def test_family_meta_fills_in_a_non_native_platform(self):
+        with patch.object(
+            server,
+            "FAMILY_META",
+            {"gemini": {"label": "Gemini CLI", "order": 5, "hint": "自动发现"}},
+        ):
+            payload = take_snapshot(self.sources())
+        gemini = next(
+            entry for entry in payload["platforms"] if entry["key"] == "gemini"
+        )
+        self.assertEqual(gemini["label"], "Gemini CLI")
+        self.assertEqual(gemini["hint"], "自动发现")
+        self.assertEqual(gemini["kind"], "discovered")
+        # order=5 排在 codex(1) 后、claude(0) 后，但在默认的 90 之前。
+        self.assertEqual(
+            [entry["key"] for entry in payload["platforms"]],
+            ["claude", "codex", "gemini"],
+        )
+
+    def test_reserved_key_guard(self):
+        server.check_source_keys(server.SOURCES)
+        with self.assertRaises(RuntimeError):
+            server.check_source_keys([make_spec("counts", [])])
+
+
 class HttpTests(unittest.TestCase):
     def setUp(self):
         self.payload = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "generatedAt": 1_000_000,
+            "version": server.APP_VERSION,
             "sources": {
                 "claude": {"state": "live", "detail": ""},
                 "codex": {"state": "live", "detail": ""},
             },
             "notifications": {"state": "ok", "detail": ""},
-            "claude": [],
-            "codex": [],
-            "counts": {"claude": 0, "codex": 0, "satellites": 0},
+            "platforms": [
+                {
+                    "key": "claude",
+                    "label": "Claude Code",
+                    "order": 0,
+                    "kind": "local",
+                    "hint": "",
+                    "dismissible": False,
+                    "lockable": False,
+                    "emptyText": "",
+                    "health": {"state": "live", "detail": ""},
+                    "agents": [],
+                },
+                {
+                    "key": "codex",
+                    "label": "Codex",
+                    "order": 1,
+                    "kind": "local",
+                    "hint": "",
+                    "dismissible": True,
+                    "lockable": True,
+                    "emptyText": "",
+                    "health": {"state": "live", "detail": ""},
+                    "agents": [],
+                },
+            ],
+            "counts": {
+                "agents": 0,
+                "satellites": 0,
+                "byPlatform": {"claude": 0, "codex": 0},
+            },
         }
         self.snapshot_patch = patch.object(
             server, "snapshot", return_value=self.payload
@@ -1422,6 +1646,16 @@ class HttpTests(unittest.TestCase):
         )
         return urllib.request.urlopen(request, timeout=10)
 
+    def set_agents(self, key, agents):
+        entry = next(
+            item for item in self.payload["platforms"] if item["key"] == key
+        )
+        entry["agents"] = agents
+        self.payload["counts"]["byPlatform"][key] = len(agents)
+        self.payload["counts"]["agents"] = sum(
+            len(item["agents"]) for item in self.payload["platforms"]
+        )
+
     def post(self, path, payload):
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}{path}",
@@ -1439,7 +1673,7 @@ class HttpTests(unittest.TestCase):
             etag = response.headers["ETag"]
             body = json.loads(response.read())
         self.assertIsNotNone(etag)
-        self.assertEqual(body["schemaVersion"], 1)
+        self.assertEqual(body["schemaVersion"], 2)
 
         try:
             with self.get("/api/agents", {"If-None-Match": etag}) as response:
@@ -1466,17 +1700,20 @@ class HttpTests(unittest.TestCase):
 
     def test_open_acknowledges_a_light_that_cannot_be_opened(self):
         # headless 的 `claude -p` 打不开，但它转绿之后必须有办法确认掉。
-        self.payload["claude"] = [
-            {
-                "id": "headless-1",
-                "platform": "claude",
-                "name": "claude -p 巡检",
-                "status": "completed",
-                "completionId": 4242,
-                "openable": False,
-                "satellites": [],
-            }
-        ]
+        self.set_agents(
+            "claude",
+            [
+                {
+                    "id": "headless-1",
+                    "platform": "claude",
+                    "name": "claude -p 巡检",
+                    "status": "completed",
+                    "completionId": 4242,
+                    "openable": False,
+                    "satellites": [],
+                }
+            ],
+        )
         original = dict(server._acknowledged_completions)
         with tempfile.TemporaryDirectory() as directory:
             try:
@@ -1497,6 +1734,64 @@ class HttpTests(unittest.TestCase):
             finally:
                 server._acknowledged_completions.clear()
                 server._acknowledged_completions.update(original)
+
+    def test_open_accepts_platform_from_payload(self):
+        # 非原生平台（没登记 open 回调）也要能受理：只确认，不打开任何窗口。
+        self.payload["platforms"].append(
+            {
+                "key": "gemini",
+                "label": "Gemini",
+                "order": 90,
+                "kind": "discovered",
+                "hint": "",
+                "dismissible": False,
+                "lockable": False,
+                "emptyText": "",
+                "health": {"state": "live", "detail": ""},
+                "agents": [
+                    {
+                        "id": "g-1",
+                        "platform": "gemini",
+                        "name": "gemini 巡检",
+                        "status": "completed",
+                        "completionId": 7,
+                        "openable": True,
+                        "origin": "process",
+                        "satellites": [],
+                    }
+                ],
+            }
+        )
+        # 平台白名单看的是最近一轮载荷，先让服务采一次样。
+        with self.get("/api/agents") as response:
+            response.read()
+        original = dict(server._acknowledged_completions)
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                server._acknowledged_completions.clear()
+                with patch.object(
+                    server, "STATE_PATH", Path(directory) / "state.json"
+                ), patch.object(server, "open_claude") as claude_opener, patch.object(
+                    server, "open_codex"
+                ) as codex_opener:
+                    body = self.post("/api/open", {"platform": "gemini", "id": "g-1"})
+                claude_opener.assert_not_called()
+                codex_opener.assert_not_called()
+                self.assertEqual(
+                    body, {"ok": True, "opened": False, "acknowledged": True}
+                )
+                self.assertEqual(server._acknowledged_completions["gemini:g-1"], 7)
+            finally:
+                server._acknowledged_completions.clear()
+                server._acknowledged_completions.update(original)
+
+    def test_open_rejects_a_platform_that_is_nowhere_in_the_payload(self):
+        try:
+            self.post("/api/open", {"platform": "nope", "id": "x"})
+            self.fail("预期 400")
+        except urllib.error.HTTPError as error:
+            self.assertEqual(error.code, 400)
+            error.close()
 
     def test_open_unknown_agent_is_still_404(self):
         try:
