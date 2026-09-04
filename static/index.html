@@ -82,27 +82,21 @@
         <span class="legend-note">动态网格 · 无空槽</span>
       </section>
 
-      <section class="platform" aria-labelledby="claudeTitle">
-        <div class="section-heading">
-          <div>
-            <p class="platform-index">01</p>
-            <h2 id="claudeTitle">Claude <span>· Terminal</span></h2>
-          </div>
-          <p><strong id="claudeCount">0</strong> 个前台会话</p>
-        </div>
-        <div class="agent-grid" id="claudeGrid"></div>
-      </section>
+      <!-- 分区由载荷里的 platforms 现生成，模板给出一个分区的 DOM 形状。 -->
+      <div id="platforms"></div>
 
-      <section class="platform" aria-labelledby="codexTitle">
-        <div class="section-heading">
-          <div>
-            <p class="platform-index">02</p>
-            <h2 id="codexTitle">Codex <span>· Client</span></h2>
+      <template id="platformSection">
+        <section class="platform">
+          <div class="section-heading">
+            <div>
+              <p class="platform-index"></p>
+              <h2><span class="platform-label"></span> <span class="platform-hint"></span></h2>
+            </div>
+            <p><strong class="platform-count">0</strong> 个会话</p>
           </div>
-          <p><strong id="codexCount">0</strong> 个近期任务</p>
-        </div>
-        <div class="agent-grid" id="codexGrid"></div>
-      </section>
+          <div class="agent-grid"></div>
+        </section>
+      </template>
 
       <footer>
         <p>点击光点，在这台 Mac 上打开对应会话</p>
