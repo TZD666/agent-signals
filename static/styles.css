@@ -850,6 +850,17 @@ h2 span {
   white-space: nowrap;
 }
 
+.agent-detail {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  margin-top: 3px;
+  color: #5f6670;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .agent-state {
   margin-top: 5px;
   color: rgba(var(--status), 0.94);
@@ -1145,6 +1156,7 @@ footer p {
 }
 
 :root[data-theme="light"] .agent-meta,
+:root[data-theme="light"] .agent-detail,
 :root[data-theme="light"] .load-text,
 :root[data-theme="light"] .satellite-overflow {
   color: #737e8f;

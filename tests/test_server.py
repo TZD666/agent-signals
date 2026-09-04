@@ -1373,6 +1373,17 @@ class HttpTests(unittest.TestCase):
         )
         return urllib.request.urlopen(request, timeout=10)
 
+    def post(self, path, payload):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertEqual(response.status, 200)
+            return json.loads(response.read())
+
     def test_unchanged_revision_answers_304(self):
         with self.get("/api/agents") as response:
             self.assertEqual(response.status, 200)
@@ -1403,6 +1414,48 @@ class HttpTests(unittest.TestCase):
         with self.get("/api/agents") as response:
             body = json.loads(response.read())
         self.assertEqual(body["sources"]["codex"]["state"], "live")
+
+    def test_open_acknowledges_a_light_that_cannot_be_opened(self):
+        # headless 的 `claude -p` 打不开，但它转绿之后必须有办法确认掉。
+        self.payload["claude"] = [
+            {
+                "id": "headless-1",
+                "platform": "claude",
+                "name": "claude -p 巡检",
+                "status": "completed",
+                "completionId": 4242,
+                "openable": False,
+                "satellites": [],
+            }
+        ]
+        original = dict(server._acknowledged_completions)
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                server._acknowledged_completions.clear()
+                with patch.object(
+                    server, "STATE_PATH", Path(directory) / "state.json"
+                ), patch.object(server, "open_claude") as opener:
+                    body = self.post(
+                        "/api/open", {"platform": "claude", "id": "headless-1"}
+                    )
+                opener.assert_not_called()
+                self.assertEqual(
+                    body, {"ok": True, "opened": False, "acknowledged": True}
+                )
+                self.assertEqual(
+                    server._acknowledged_completions["claude:headless-1"], 4242
+                )
+            finally:
+                server._acknowledged_completions.clear()
+                server._acknowledged_completions.update(original)
+
+    def test_open_unknown_agent_is_still_404(self):
+        try:
+            self.post("/api/open", {"platform": "claude", "id": "ghost"})
+            self.fail("预期 404")
+        except urllib.error.HTTPError as error:
+            self.assertEqual(error.code, 404)
+            error.close()
 
     def test_health_carries_version_and_platforms(self):
         with self.get("/health") as response:

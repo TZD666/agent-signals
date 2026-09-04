@@ -3297,18 +3297,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "未知平台"}, 400)
             return
         agent = find_agent(platform, agent_id)
-        if not agent or not agent.get("openable"):
-            self.send_json({"error": "会话已经离线或不可打开"}, 404)
+        if not agent:
+            self.send_json({"error": "会话已经离线"}, 404)
             return
-        try:
-            spec.open(agent)
-        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-            self.send_json({"error": str(error)}, 500)
-            return
+        opened = False
+        if agent.get("openable"):
+            try:
+                spec.open(agent)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                self.send_json({"error": str(error)}, 500)
+                return
+            opened = True
+        # 打不开的灯（headless 的 `claude -p` 就是）也要能被确认掉，
+        # 否则它一转绿就再没有任何办法消掉。
         acknowledged = acknowledge_agent(agent)
         if acknowledged:
             refresh_snapshot()
-        self.send_json({"ok": True, "acknowledged": acknowledged})
+        self.send_json(
+            {"ok": True, "opened": opened, "acknowledged": acknowledged}
+        )
 
 
 def parse_args() -> argparse.Namespace:

@@ -261,6 +261,8 @@ function visibleAgents(platform, agents) {
 function cardMarkup(agent) {
   const status = STATUS_LABELS[agent.status] || agent.status;
   const note = durationNote(agent);
+  // 打不开的灯（headless 的 claude -p）转绿之后还剩一件事能做：确认掉它。
+  const canAcknowledge = !agent.openable && agent.status === "completed";
   const showIdleControls = agent.platform === "codex" && agent.status === "idle";
   const controls = showIdleControls
     ? `
@@ -291,8 +293,9 @@ function cardMarkup(agent) {
       <button
         class="agent-open"
         type="button"
-        ${agent.openable ? "" : "disabled"}
-        aria-label="打开 ${escapeHtml(agent.name)}，当前${escapeHtml(status)}"
+        ${agent.openable ? "" : `data-open="false"`}
+        ${agent.openable || canAcknowledge ? "" : "disabled"}
+        aria-label="${canAcknowledge ? "确认完成" : "打开"} ${escapeHtml(agent.name)}，当前${escapeHtml(status)}"
       >
         <span class="signal-stage" aria-hidden="true">
           <span class="signal-ring ring-one"></span>
@@ -303,6 +306,7 @@ function cardMarkup(agent) {
         </span>
         <span class="agent-copy">
           <span class="agent-name" title="${escapeHtml(agent.name)}">${escapeHtml(agent.name)}</span>
+          ${agent.detail ? `<span class="agent-detail">${escapeHtml(agent.detail)}</span>` : ""}
           <span class="agent-state">${escapeHtml(status)}</span>
           ${note ? `<span class="agent-note">${escapeHtml(note)}</span>` : ""}
           ${loadMarkup(agent)}
@@ -606,9 +610,10 @@ function acknowledgeCompleted(agent, platform) {
 async function openAgent(button) {
   if (button.disabled) return;
   const card = button.closest(".agent-card");
+  const willOpen = button.dataset.open !== "false";
   card.classList.add("opening");
   button.setAttribute("aria-busy", "true");
-  showToast("正在请求 Mac 打开对应会话…");
+  showToast(willOpen ? "正在请求 Mac 打开对应会话…" : "正在确认完成状态…");
   try {
     const response = await fetch("/api/open", {
       method: "POST",
@@ -627,9 +632,11 @@ async function openAgent(button) {
       snapshotSignature = "";
       render(latestData);
     }
-    showToast(
-      acknowledged ? "已进入任务并确认完成状态" : "已在 Mac 前台打开对应会话",
-    );
+    // opened:false 是正常结果，不是错误：服务只做了确认，没有打开任何窗口。
+    let message = "已在 Mac 前台打开对应会话";
+    if (result.opened === false) message = "已确认完成状态";
+    else if (acknowledged) message = "已进入任务并确认完成状态";
+    showToast(message);
   } catch (error) {
     showToast(error.message, true);
   } finally {
