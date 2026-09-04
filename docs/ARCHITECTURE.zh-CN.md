@@ -13,7 +13,34 @@
 - 紫：疑似卡死
 - 红：异常退出
 
-点击主灯会在 Mac 上打开对应的 Terminal 标签页或 Codex 任务，并由本地服务确认这次完成状态。子代理显示为主灯外围的小卫星点。
+点击主灯会在 Mac 上打开对应的 Terminal 标签页、Claude 桌面 App 或 Codex 任务，并由本地服务确认这次完成状态。子代理显示为主灯外围的小卫星点。
+
+## 会话种类
+
+面板不再假设"Claude 会话＝一个 Terminal 标签页"。每盏灯按登记表里的 `entrypoint` 标出自己的来路：
+
+| entrypoint | 灯上显示 |
+| --- | --- |
+| `cli` / 字段缺失 | Terminal |
+| `claude-desktop` | 桌面 App |
+| `claude-vscode` | VS Code |
+| `sdk-cli` | claude -p 后台 |
+| `sdk-ts` / `sdk-py` | SDK |
+| `mcp` | MCP |
+| `local-agent` / `local_agent` | 桌面 Cowork |
+
+认不出的入口原样显示，不假装是终端。老登记表不写 `entrypoint`，这时靠命令行里的 `Application Support/Claude/claude-code/` 认出桌面 App 自带的那个二进制。
+
+桌面 App 的会话还会和它自己的会话索引对一次（`~/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json`，按 `cliSessionId` 关联，60 秒缓存，坏文件跳过）：索引里的标题盖掉自动生成的会话名（自己起的名字不动），点灯打开的是 Claude.app 而不是 Terminal 标签页。
+
+`claude -p` 的登记表不写 `status`，照原来的读法它永远是一盏假的白灯。这种会话改看活动信号：`AGENT_SIGNALS_CLAUDE_HEADLESS_ACTIVE_MS`（默认 30 秒）内还有 CPU 增量或 transcript 写入就算思考中，静下来即转已完成。它没有可以切过去的界面，所以点不开。
+
+## 卫星
+
+主灯外围的小卫星点有两种来路：
+
+- **登记表卫星**：`claude --bg` 后台会话，以及被某个会话拉起来的 `claude -p`。挂靠改成沿 PPID 链上溯（≤8 层）找真正的父会话，找不到才退回原来的"同目录 / 最近活跃"猜测——之前同目录的另一盏灯会把它抢走。
+- **子代理卫星**：Task 子代理（`<transcript 目录>/<sessionId>/subagents/agent-*.jsonl`）。它没有结束标记，只能看 jsonl 的 mtime：`AGENT_SIGNALS_SUBAGENT_ACTIVE_MS`（60 秒）内有写入算思考中，之后转已完成，静默超过 `AGENT_SIGNALS_SUBAGENT_LINGER_MS`（10 分钟）不再显示。只 stat 文件加读同名的小 `.meta.json`，一个字对话内容都不读；这类卫星只作展示，不参与完成确认。
 
 ## 疑似卡死怎么判定
 
@@ -110,6 +137,10 @@ Codex 数据库会同时从 `~/.codex/` 与 `~/.codex/sqlite/` 探测，并优�
 | `CLAUDE_SESSIONS_DIR` | `~/.claude/sessions` | Claude 会话目录 |
 | `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | Claude transcript 目录 |
 | `AGENT_SIGNALS_CLAUDE_CONTEXT_WINDOW` | `200000` | Claude transcript 不含窗口大小，负载条分母用它 |
+| `CLAUDE_DESKTOP_SUPPORT_DIR` | `~/Library/Application Support/Claude` | 桌面 App 的会话索引所在目录 |
+| `AGENT_SIGNALS_CLAUDE_HEADLESS_ACTIVE_MS` | `30000` | headless 会话静默多久算做完 |
+| `AGENT_SIGNALS_SUBAGENT_ACTIVE_MS` | `60000` | 子代理卫星静默多久算做完 |
+| `AGENT_SIGNALS_SUBAGENT_LINGER_MS` | `600000` | 做完的子代理卫星还显示多久 |
 | `AGENT_SIGNALS_HISTORY` | `1` | 设为 `0` 完全关闭历史埋点与费用估算 |
 | `AGENT_SIGNALS_HISTORY_DB` | 运行目录/`agent-history.db` | 历史库路径 |
 | `AGENT_SIGNALS_CODEX_PRICES` | 运行目录/`codex_prices.json` | Codex 估算价格文件（可手工编辑） |
