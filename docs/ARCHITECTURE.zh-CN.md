@@ -98,7 +98,7 @@
 
 ```
 {
-  "schemaVersion": 2, "generatedAt": …, "version": "2.3.1",
+  "schemaVersion": 2, "generatedAt": …, "version": "2.3.2",
   "sources":       { "<源 key>": {state, detail} },      // 采集端健康度，按来源
   "notifications": {state, detail},
   "platforms": [
