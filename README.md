@@ -4,7 +4,9 @@
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A local breathing-light panel that shows what your Claude Code and Codex sessions
-are doing right now — thinking, waiting on you, finished, or quietly stuck.
+are doing right now — thinking, waiting on you, finished, or quietly stuck. Other
+agent CLIs running on the same Mac are recognized from the process table and get
+a section of their own, with nothing to configure.
 
 Read [中文文档](README.zh-CN.md) instead.
 
@@ -26,7 +28,7 @@ alt-tabbing through terminal windows to see whether an agent is still working.
 | OS | macOS — the panel shells out to `osascript` (notifications, window focus) and BSD `ps` |
 | Python | 3.9 or newer. macOS ships one at `/usr/bin/python3` |
 | Node | 16 or newer — only if you install via npm; running from source needs no Node |
-| Agents | Claude Code and/or Codex Desktop. Either one alone works; the other source just reports as unavailable |
+| Agents | Claude Code and/or Codex Desktop. Either one alone works; the other source just reports as unavailable. Any other agent CLI needs no setup here — see Auto-discovered runtimes below |
 
 No third-party Python packages. `server.py` runs on the standard library alone,
 which is why [`requirements.txt`](requirements.txt) is empty by design.
@@ -77,8 +79,8 @@ agent-signals --host 127.0.0.1  # local only, no LAN access
 
 Clicking the main light opens the matching Terminal tab, desktop app, or Codex
 thread on the Mac, and the local service marks that completion as
-acknowledged. Subagents show up as small satellite dots orbiting the main
-light — see Satellites below.
+acknowledged. Subagents and team agents show up as small satellite dots orbiting
+the main light — see Satellites below.
 
 ## Session kinds
 
@@ -118,9 +120,97 @@ can still be clicked once it turns green — the service just marks the
 completion acknowledged without opening anything, otherwise it would stay
 green forever.
 
+## Auto-discovered runtimes
+
+The panel is no longer limited to Claude Code and Codex. Every sampling pass runs
+the same `ps` table through a discovery engine (`discovery.py`) that recognizes
+agent runtimes with no native data source of their own, and each family gets its
+own section. Install another agent CLI, run it, and it appears — there is nothing
+to configure.
+
+A process becomes a light in one of two ways:
+
+- **A family the panel already knows.** A seed table of 18 runtimes — Claude,
+  Codex, DeepSeek Harness (`dsh`), OpenClaw, Gemini CLI, OpenCode, Aider, Goose,
+  Amp, Qwen Code, Kimi CLI, Copilot CLI, Cursor Agent, Hermes, Pi, Droid, Crush,
+  WorkBuddy — matched either on an exact executable name or on a fragment of the
+  package path (`@openai/codex/`, `@deepseek-ai/dsh/`,
+  `/Applications/WorkBuddy.app/`). Interpreter-plus-script command lines count
+  too, and no `.js` / `.py` suffix is required: a globally installed npm CLI is
+  an extensionless symlink (`/opt/homebrew/bin/dsh` →
+  `…/node_modules/@deepseek-ai/dsh/lib/bin.js`), so symlinks are resolved — and
+  cached — before package paths are compared.
+- **A family nobody has told it about.** If a command line mentions `~/.<name>/`,
+  `~/.config/<name>/` or `~/Library/Application Support/<Name>/`, and that
+  directory looks like an agent's home — it contains `sessions/`, `threads/`,
+  `conversations/`, a `history.jsonl` or a `rollout-*.jsonl`; or a shallow sqlite
+  file whose table names mention session / thread / conversation / run / message;
+  or a `settings.*` next to a `profiles/` — a family named after the directory is
+  derived on the spot. `mkdir -p ~/.fakeagent/sessions` plus any process running
+  out of it is enough to get a "Fakeagent" section.
+
+What a discovered light can and cannot tell you:
+
+- Its subtitle reads `自动发现` (auto-discovered) followed by the home directory,
+  with a small `未登记进程` (unregistered process) caption underneath: nothing in
+  any registry vouches for this light.
+- It has no load bar — hatching and a `—`. There is no transcript behind it to
+  read token counts from, and a fabricated 0% would be worse than nothing.
+- Status is inferred from activity alone: a CPU delta across the process tree, or
+  a fresh write under the family's home directory. Within
+  `AGENT_SIGNALS_DISCOVERY_ACTIVE_MS` (20s default) of either it counts as
+  thinking; once it goes quiet it flips to finished.
+- The activity signal has to mean *working*, not merely *alive* — a lesson this
+  panel learned the hard way. A GUI agent app rewrites its logs every few seconds
+  and its session registry on a fixed heartbeat; watch those and the light never
+  goes quiet, so it can never turn green. Families that live in a `.app` bundle
+  are therefore watched **only** through the files their profile names, and their
+  CPU is ignored outright (an idle Electron renderer burns enough CPU to look
+  busy about half the time). The trade-off is real: if a bundled family's profile
+  watches the wrong files, its light stays white while work happens. Agents run
+  from a terminal are unaffected and still use CPU.
+- Discovered lights are only ever idle, thinking, or finished. *Needs input* and
+  *possibly stuck* are not knowable without a native data source, so they are
+  never claimed. A light that was only briefly busy also finishes without a Mac
+  notification — see `AGENT_SIGNALS_DISCOVERY_NOTIFY_MIN_BUSY_MS`.
+
+Clicking one opens whatever that family's profile says to open: a Terminal tab, a
+local web UI (loopback only — `127.0.0.1` plus a numeric port that came from the
+profile or from a listening-port probe, never from the request), or a Mac app by
+name. A process living inside a `.app` bundle has no Terminal tab to switch to
+and is marked unopenable; like a bare `claude -p`, its green can still be cleared
+by a click that opens nothing.
+
+Claude sessions found by process rather than by registry — the binary the desktop
+app ships — are labeled Desktop app and click through to Claude.app.
+
+The rails that keep it from lighting up your whole machine:
+
+- Only processes owned by you. System paths (`/System/`, `/usr/libexec/`, …),
+  Electron `--type=` helper processes, and an explicit deny-list are never lit,
+  and the panel never lights itself.
+- Anything a native source already claims is skipped: every pid in Claude's
+  session registry along with its descendants, and the `ChatGPT.app` process tree
+  that Codex lights come from.
+- A process must be at least `AGENT_SIGNALS_DISCOVERY_MIN_AGE_S` (5s) old before
+  it gets a light, and a new light stays idle through its first two samples while
+  activity is only being recorded — otherwise every light would flash a fake
+  green the moment it was born.
+- At most `AGENT_SIGNALS_DISCOVERY_MAX_AGENTS` (24) discovered agents, newest
+  first; the section says how many it truncated.
+
+Two limits worth knowing up front. This finds **processes**: an agent that is
+installed but not currently running is invisible, because this is a "what is
+running right now" panel and not an inventory. And a runtime that is neither in
+the seed table nor leaves a recognizable home directory behind is not found at
+all until a later release teaches it. Discovered lights also carry no cost or
+history accounting — see Cost & history below.
+
+Set `AGENT_SIGNALS_DISCOVERY=0` to switch the whole thing off.
+
 ## Satellites
 
-The small dots orbiting a main light come from two places:
+The small dots orbiting a main light come from three places:
 
 - **Registry satellites**: `claude --bg` background sessions, and any
   `claude -p` launched by another session. Attachment is resolved by walking
@@ -128,6 +218,15 @@ The small dots orbiting a main light come from two places:
   falling back to a same-directory / most-recently-active guess only when
   that fails — a guess another light in the same directory can end up
   claiming instead.
+- **Team satellites**: the agents a Claude Code team dispatches. They write only
+  a `.key` file into `~/.claude/sessions/` and never a `.json`, so the registry
+  cannot claim them; auto-discovery is what finds them. Their command line
+  carries `--parent-session-id`, and when that points at a session still on the
+  registry the process orbits that light under its own `--agent-name`
+  (`gh-search`, `exec-runway` — the name you see in your own team view). Status
+  comes from the discovery activity signals; no transcript is read. When the
+  parent session is not on the registry, the process gets its own light instead
+  — not finding a parent is no reason to make a running process disappear.
 - **Subagent satellites**: Task subagents. They have no completion marker, so
   the panel watches the mtime of their transcript file: a write within
   `AGENT_SIGNALS_SUBAGENT_ACTIVE_MS` (60s default) counts as thinking, then it
@@ -168,7 +267,8 @@ Every main card shows a thin load bar and label under its status, e.g.
   notification.
 - When token data can't be read, the bar renders as hatching with `—` instead
   of a misleading 0%.
-- Satellites (subagents) don't show a load bar, to keep them lightweight.
+- Satellites don't show a load bar, to keep them lightweight; auto-discovered
+  lights don't either, since there is no transcript behind them to read.
 
 ## Cost & history (the ¢ button)
 
@@ -188,6 +288,10 @@ cost) — clicking a row expands its turn-by-turn timeline.
   didn't actually pay this; Codex/GPT prices come from a local
   `codex_prices.json` (hand-editable) and are always labeled "estimated."
   Models with no known price show `—` rather than a guessed number.
+- **Claude and Codex only**: the job reads Claude transcripts and Codex
+  rollouts. Auto-discovered runtimes have neither, so they never show up in the
+  cost panel or the session list — their lights say what a process is doing,
+  nothing about what it spent.
 - **Known limitation**: `--resume` sessions fold prior turns into the new
   session, so a single-session view is accurate but summing across sessions
   double-counts.
@@ -291,6 +395,12 @@ alerting is handled by the native Mac notifications instead.
 | `AGENT_SIGNALS_CODEX_PRICES` | `codex_prices.json` in the run directory | Codex estimated-price file (hand-editable) |
 | `AGENT_SIGNALS_CLAUDE_PRICES` | tokenusage's `prices.json` | Claude price mirror path |
 | `AGENT_SIGNALS_HISTORY_BACKFILL_DAYS` | `30` | How many days of history to backfill |
+| `AGENT_SIGNALS_DISCOVERY` | `1` | Set to `0` to disable auto-discovery |
+| `AGENT_SIGNALS_DISCOVERY_ACTIVE_MS` | `20000` | How long a discovered light can go quiet before it's marked finished |
+| `AGENT_SIGNALS_DISCOVERY_WARMUP_SAMPLES` | `2` | Samples a new discovered light stays idle for while activity is only recorded |
+| `AGENT_SIGNALS_DISCOVERY_MIN_AGE_S` | `5` | A process younger than this gets no light |
+| `AGENT_SIGNALS_DISCOVERY_MAX_AGENTS` | `24` | Ceiling on how many discovered lights are shown |
+| `AGENT_SIGNALS_DISCOVERY_NOTIFY_MIN_BUSY_MS` | `60000` | How long a discovered light must have been busy for its completion to notify |
 | `AGENT_SIGNALS_PYTHON` | auto-discovered | Interpreter the npm launcher should use |
 
 ## Miscellaneous
@@ -321,6 +431,9 @@ up the iPad view.
 python3 -m unittest discover tests -v
 ```
 
+217 tests today, on the standard library alone — there is no test runner to
+install.
+
 ## Deployment
 
 Deploys go through `./deploy.sh` — don't `cp` files by hand:
@@ -329,9 +442,12 @@ Deploys go through `./deploy.sh` — don't `cp` files by hand:
 ./deploy.sh
 ```
 
-Four fixed steps: run the tests → copy `server.py` and `static/*` into the
-run directory → `launchctl kickstart -k` to restart the service → poll
-`/health` until `version` matches and `pid` has changed (20-second timeout).
+Four fixed steps: run the tests → copy `server.py`, `discovery.py` and
+`static/*` into the run directory → `launchctl kickstart -k` to restart the
+service → poll `/health` until `version` matches and `pid` has changed
+(20-second timeout). `discovery.py` is copied unconditionally: `server.py` loads
+it by path at startup and will not boot without it, so it is better for the `cp`
+step to fail loudly than for the run directory to end up half-copied.
 If the tests fail, nothing gets copied. Checking the pid matters because
 comparing versions alone can be fooled: `APP_VERSION` is a constant that
 doesn't change within a deploy, so if the port is held by some stray process
@@ -351,6 +467,7 @@ what the deploy script polls to confirm the restart actually landed.
 
 ```
 server.py                 state sampling + HTTP service + notifications + history/cost tracking
+discovery.py              discovery engine (pure functions, imports nothing from server): seed table + dotdir rule
 bin/cli.js                npm launcher, hands over to python3
 static/index.html         page skeleton
 static/app.js             rendering, long polling, alert sound, cost & history panel
@@ -359,6 +476,7 @@ static/icon-180.png       home screen icon
 static/manifest.webmanifest
 tests/test_server.py      breathing-light core tests
 tests/test_history.py     history tracking and cost estimation tests
+tests/test_discovery.py   discovery engine and discovered-light tests
 run.command               double-click launcher
 deploy.sh                 deploy to the launchd run directory (test → copy → restart → verify version)
 docs/ARCHITECTURE.zh-CN.md  full technical architecture doc
@@ -371,5 +489,5 @@ requirements.txt          no third-party dependencies, by design
 
 ## Roadmap
 
-Auto-discovery of other agent runtimes beyond Codex, and cloud sessions, are
-in progress on this branch and not yet released.
+Auto-discovery of other agent runtimes has landed — see Auto-discovered runtimes
+above. Cloud sessions are still in progress on this branch and not yet released.
