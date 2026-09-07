@@ -1499,6 +1499,34 @@ def process_cwd(pid: int) -> str:
     return cwd
 
 
+def useful_cwd(cwd: str) -> bool:
+    """这个 cwd 拿来给灯起名字有没有意义。
+
+    真机上 WorkBuddy 主进程的 cwd 就是 `/`，拼出来的灯叫「WorkBuddy · /」；
+    它的成员进程要么也在 `/`，要么在 `.app` 包里、要么在 `/private/var/folders`
+    的临时目录里——都不是用户认得的东西。认不出就别硬拼。
+    """
+    if not cwd or cwd == "/":
+        return False
+    if discovery.BUNDLE_MARKER in cwd:
+        return False
+    return not cwd.startswith(("/private/var/folders/", "/var/folders/", "/tmp/"))
+
+
+def candidate_cwd(candidate: Any) -> str:
+    """给灯起名字用的 cwd：根进程说不清就问成员，都说不清就返回空串。"""
+    cwd = process_cwd(candidate.pid)
+    if useful_cwd(cwd):
+        return cwd
+    for pid in candidate.members:
+        if pid == candidate.pid:
+            continue
+        member = process_cwd(pid)
+        if useful_cwd(member):
+            return member
+    return ""
+
+
 def discovered_open_via(candidate: Any) -> str:
     """画像里的 open 字段 → 灯自己带的 openVia 串。
 
@@ -1543,9 +1571,15 @@ def discovered_agent(
     agent_id = f"{candidate.pid}-{stamp}"
     key = completion_key(candidate.family, agent_id)
 
+    # GUI 应用包里的候选不看 CPU 增量。实测 WorkBuddy 空转 24 个 5 秒窗口，
+    # 有 11 个的进程树 CPU 增量越过 CPU_EPSILON(0.05)，峰值 1.0 秒——渲染进程
+    # 本来就一直在烧 CPU，这个信号在 GUI 应用上分不开「开着」和「在干活」，
+    # 留着它灯会每隔半分钟假装完成一次。这类家族只认 watch 文件（WorkBuddy
+    # 的 traces 空转 120 秒零变化，任务时才写），认不出来就靠画像补 glob。
+    cpu = 0.0 if candidate.bundle_anywhere else tree_cpu(candidate.pid, table)
     quiet_since = note_activity(
         key,
-        tree_cpu(candidate.pid, table),
+        cpu,
         watch_mtime(candidate.home, candidate.watch),
         current_ms,
     )
@@ -1588,10 +1622,13 @@ def discovered_agent(
         # 而且它点得开——`open -a Claude`，不是去找一个并不存在的终端标签页。
         detail = "桌面 App"
         open_via = "app:Claude"
-    cwd = process_cwd(candidate.pid)
+    cwd = candidate_cwd(candidate)
     # teammate 进程自报的名字（`gh-search` / `exec-runway`）就是用户在自己的
     # team 界面里看到的那个，比 cwd 拼出来的「Claude · memory」有用得多。
-    name = candidate.agent_name or f"{candidate.label} · {cwd_label(cwd)}"
+    # cwd 说不清的（GUI 应用的主进程常常就在 `/`）只留家族名，不拼「· /」。
+    name = candidate.agent_name or (
+        f"{candidate.label} · {cwd_label(cwd)}" if cwd else candidate.label
+    )
     agent = {
         "id": agent_id,
         "pid": candidate.pid,
@@ -1621,6 +1658,10 @@ def discovered_agent(
     return agent
 
 
+# `--parent-session-id` / `--agent-name` 是 Claude 的命令行约定，挂靠只对它成立。
+TEAMMATE_FAMILY = "claude"
+
+
 def satellite_hosts(context: SampleContext | None) -> dict[str, dict[str, Any]]:
     """本轮已经出好的原生 Claude 灯，按 sessionId 建表。
 
@@ -1639,7 +1680,15 @@ def satellite_hosts(context: SampleContext | None) -> dict[str, dict[str, Any]]:
 def attach_teammate(
     agent: dict[str, Any], candidate: Any, hosts: dict[str, dict[str, Any]]
 ) -> bool:
-    """能挂就挂成父灯的卫星；挂上了返回 True。"""
+    """能挂就挂成父灯的卫星；挂上了返回 True。
+
+    只认 Claude 家族：`--parent-session-id` 是 Claude 自己的会话 id 约定，
+    hosts 里装的也只有 Claude 灯。别的家族哪怕碰巧也用 `--agent-name` /
+    `--parent-session-id` 这两个参数名，它的值也不是 Claude 的 sessionId，
+    往这张表上查是没有道理的。
+    """
+    if candidate.family != TEAMMATE_FAMILY:
+        return False
     host = hosts.get(candidate.parent_session)
     if host is None:
         return False
@@ -3243,7 +3292,13 @@ discovered_spec = SourceSpec(
     is_platform=False,
 )
 
-# 按 order 排好序声明；载荷里的先后就是这里的先后。
+# ⚠️ 采样顺序 = **这个列表的书写顺序**，没有任何地方按 `.order` 排过它。
+# `.order` 只管 platforms 分区的展示排序，两者今天恰好一致，但不是一回事。
+#
+# `discovered_spec` 必须排在 `claude_spec` 后面：teammate 进程要挂到 Claude 源
+# 刚交出来的那些灯上（`satellite_hosts` 读 ctx["loaded"]）。顺序错了会静默
+# 退化成「teammate 各自占一张卡」——安全，但没人会发现。往这里插新源时，
+# 要么插在 discovered 之前，要么确认它不依赖别人的产出。
 SOURCES: list[SourceSpec] = [claude_spec, codex_spec, discovered_spec]
 
 # 载荷的根键。平台不再拼进根上，但 key 撞名依然会让前端把平台当元数据读，
@@ -3419,6 +3474,7 @@ def snapshot(locked_codex_ids: set[str] | None = None) -> dict[str, Any]:
     }
     loaded: list[tuple[str, list[dict[str, Any]], dict[str, str]]] = []
     # 后跑的源看得见前面的源交出了什么（自动发现要往 Claude 灯上挂卫星）。
+    # 「先后」指的是 SOURCES 的**列表位置**，不是 spec.order——见那里的警告。
     context["loaded"] = loaded
     sources: dict[str, dict[str, str]] = {}
     for spec in SOURCES:

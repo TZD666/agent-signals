@@ -71,6 +71,12 @@ FRAMEWORK_PYTHON = (
     "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/"
     "Versions/3.14/Resources/Python.app/Contents/MacOS/Python"
 )
+CHROME_CRASHPAD = (
+    "/Applications/Google Chrome.app/Contents/Frameworks/"
+    "Google Chrome Framework.framework/Versions/152.0.7977.65/Helpers/"
+    "chrome_crashpad_handler --monitor-self-annotation=ptype=crashpad-handler "
+    "--database=/Users/edy/Library/Application Support/Google/Chrome/Crashpad"
+)
 CHROME_HELPER = (
     "/Applications/Google Chrome.app/Contents/Frameworks/"
     "Google Chrome Framework.framework/Versions/152.0.7977.65/Helpers/"
@@ -130,9 +136,40 @@ WORKBUDDY_HELPER = (
     "WorkBuddy Helper (GPU) --type=gpu-process "
     "--user-data-dir=/Users/edy/.workbuddy"
 )
+# 以下五条是 2026-09-07 用户真开着 WorkBuddy 时抓的原样 ps 行。
+WORKBUDDY_MAIN_REAL = "/Applications/WorkBuddy.app/Contents/MacOS/Electron"
+WORKBUDDY_CRASHPAD = (
+    "/Applications/WorkBuddy.app/Contents/Frameworks/Electron Framework.framework/"
+    "Helpers/chrome_crashpad_handler --no-rate-limit --no-upload-gzip "
+    "--monitor-self-annotation=ptype=crashpad-handler "
+    "--database=/Users/edy/.workbuddy/app/Crashpad "
+    "--url=https://galileotelemetry.tencent.com/crashReport"
+)
 WORKBUDDY_SANDBOX = (
-    "/Users/edy/.workbuddy/binaries/sandbox-center "
-    '--config {"appHome":"/Users/edy/.workbuddy","port":63296}'
+    "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/vendor/"
+    'sandbox/5.5.5/sandbox-center --config {"appHome":"/Users/edy/.workbuddy",'
+    '"cipher":{"detectionEnabled":true}} --app_home /Users/edy/.workbuddy'
+)
+WORKBUDDY_CODEBUDDY = (
+    "/Applications/WorkBuddy.app/Contents/MacOS/Electron "
+    "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/"
+    "codebuddy --serve --session-id 251af04a-0000-4000-8000-000000000000 "
+    "--model hy4-preview"
+)
+# 只是在参数里提到 ~/.workbuddy/ 的旁观者：两个插件的 MCP server，和一个
+# 采集 shell 环境的临时 zsh。都不是 agent。
+WORKBUDDY_PLUGIN_MCP = (
+    "/Users/edy/.workbuddy/binaries/node/v22.21.1/bin/node "
+    "/Users/edy/.workbuddy/plugins/cache/workbuddy-builtin/weixinpay/1.6.109/"
+    "dist/mcp-server.mjs"
+)
+WORKBUDDY_PLUGIN_MCP_TWO = (
+    "node /Users/edy/.workbuddy/plugins/cache/workbuddy-builtin/sheetagent/"
+    "1.2.0/mcp/start.mjs"
+)
+WORKBUDDY_SNAPSHOT_ZSH = (
+    "/bin/zsh -c -l SNAPSHOT_FILE='/Users/edy/.workbuddy/shell-snapshots/"
+    "snapshot-zsh-1757-abc.sh' && command -v cat"
 )
 PARENT_SID = "af37fb6d-5c6b-4e6e-8642-736b4798f617"
 TEAMMATE = (
@@ -529,6 +566,20 @@ class HardExclusionTests(unittest.TestCase):
         self.assertEqual(result.candidates, [])
         self.assertEqual(result.unclassified, [])
 
+    def test_crash_reporters_are_never_agents(self):
+        # 真机：WorkBuddy 的 crashpad 命中种子的 .app 路径片段，又被 macOS
+        # 重挂到 launchd（ppid=1），roll-up 够不着 → 面板多出整整一盏灯。
+        result = run([(15397, 1, UID, WORKBUDDY_CRASHPAD)])
+        self.assertEqual(result.candidates, [])
+        self.assertEqual(result.unclassified, [])
+        # 黑名单要认的是路径区最后那一段：带空格的 .app 路径切出来的 argv[0]
+        # 是 `/Applications/WorkBuddy.app/Contents/Frameworks/Electron`。
+        argv = discovery.parse_argv(WORKBUDDY_CRASHPAD)
+        self.assertEqual(argv.basename, "Electron")
+        self.assertEqual(argv.region_basename, "chrome_crashpad_handler")
+        # Chrome / ChatGPT.app 的 crashpad 同样被挡住。
+        self.assertEqual(run([(1624, 1, UID, CHROME_CRASHPAD)]).candidates, [])
+
     def test_other_uid_excluded(self):
         rows = [(9001, 1, 0, CLAUDE_LOCAL)]
         self.assertEqual(run(rows).candidates, [])
@@ -682,13 +733,43 @@ class DotdirTests(unittest.TestCase):
         # 真正的 claude 进程照旧靠 basename 命中，不受影响。
         self.assertEqual(families(run([(29796, 1, UID, CLAUDE_LOCAL)])), ["claude"])
 
-    def test_dotdir_converges_onto_the_seed_family_key(self):
-        # ~/.workbuddy/sessions/ 会把家族名推成 workbuddy，与种子表同名：
-        # 必须收敛到同一个 key，不能出现 workbuddy 与 WorkBuddy 两个分区。
-        result = run([(93860, 1, UID, WORKBUDDY_SANDBOX)])
+    def test_dotdir_never_forks_a_family_that_already_has_a_seed(self):
+        # 真机实测：WorkBuddy 开着的时候，两个插件的 MCP server 和一个采集
+        # shell 环境的临时 zsh 只是在参数里**提到**了 ~/.workbuddy/，就各自
+        # 点亮了一盏灯。它们不是 agent。
+        bystanders = [
+            (15900, 1, UID, WORKBUDDY_PLUGIN_MCP),
+            (15901, 1, UID, WORKBUDDY_PLUGIN_MCP_TWO),
+            (15918, 1, UID, WORKBUDDY_SNAPSHOT_ZSH),
+        ]
+        # 没有 WorkBuddy 那盏灯时：整条丢掉，一盏都不出。
+        self.assertEqual(run(bystanders).candidates, [])
+        # WorkBuddy 在跑时：并进那盏灯当成员，仍然只有一盏灯。
+        result = run([(15116, 1, UID, WORKBUDDY_MAIN_REAL, 500)] + bystanders)
         self.assertEqual(families(result), ["workbuddy"])
-        self.assertEqual(result.candidates[0].label, "WorkBuddy")
-        self.assertEqual(result.candidates[0].source, "dotdir")
+        candidate = result.candidates[0]
+        self.assertEqual(candidate.pid, 15116)
+        self.assertEqual(candidate.label, "WorkBuddy")
+        # 身份完全来自种子画像，不会出现目录名推出来的 `Workbuddy`（小写 b）。
+        self.assertEqual(candidate.home_label, "~/.workbuddy")
+        self.assertEqual(candidate.open, {"app": "WorkBuddy"})
+        for pid in (15900, 15901, 15918):
+            self.assertIn(pid, candidate.members)
+
+    def test_a_brand_new_dotdir_family_still_gets_its_own_light(self):
+        # 上面那条只针对「种子表里已经有的家族」。现学的家族不受影响。
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".fakeagent" / "sessions").mkdir(parents=True)
+            result = discovery.classify(
+                table([(100, 1, UID, f"python3 {home}/.fakeagent/run.py")]),
+                discovery.DEFAULT_PROFILES,
+                discovery.DEFAULT_PROFILES["ignore"],
+                set(),
+                home,
+                UID,
+            )
+        self.assertEqual(families(result), ["fakeagent"])
 
     def test_gui_app_bundled_interpreter_never_infers_a_dotdir_family(self):
         # 反向的洞：脚本不在包里，身份判据（in_bundle）就是 False，
@@ -780,6 +861,42 @@ class RollUpTests(unittest.TestCase):
         # 中间隔着一个异族候选，不再往上认亲：三盏灯。
         self.assertEqual(sorted(c.pid for c in result.candidates), [100, 200, 300])
 
+    def test_same_app_bundle_merges_without_a_parent_chain(self):
+        # macOS 把 helper 重挂到 launchd 之后父子链是断的，roll-up 够不着。
+        # 同 family + 同 .app 包必须仍然收成一盏。
+        rows = [
+            (15116, 1, UID, WORKBUDDY_MAIN_REAL, 500),
+            (16344, 15116, UID, WORKBUDDY_SANDBOX, 800),
+            # 故意让它 ppid=1，且比主进程还老，验证根取最老的那个。
+            (15100, 1, UID, WORKBUDDY_CODEBUDDY, 400),
+        ]
+        result = run(rows)
+        self.assertEqual(len(result.candidates), 1)
+        candidate = result.candidates[0]
+        self.assertEqual(candidate.pid, 15100)
+        self.assertEqual(candidate.members, (15100, 15116, 16344))
+
+    def test_app_bundle_merge_does_not_cross_families_or_apps(self):
+        rows = [
+            (15116, 1, UID, WORKBUDDY_MAIN_REAL, 500),
+            (22118, 1, UID, CLAUDE_APP_MAIN, 500),
+            (5001, 1, UID, DSH_NODE, 500),
+        ]
+        # Claude.app 不是 agent（谁都不认它），dsh 不在任何 .app 包里。
+        self.assertEqual(families(run(rows)), ["dsh", "workbuddy"])
+
+    def test_app_bundle_root_ignores_interpreter_shells(self):
+        self.assertEqual(
+            discovery.app_bundle_root(WORKBUDDY_MAIN_REAL),
+            "/Applications/WorkBuddy.app",
+        )
+        self.assertEqual(
+            discovery.app_bundle_root(discovery.parse_argv(WORKBUDDY_CODEBUDDY).region),
+            "/Applications/WorkBuddy.app",
+        )
+        self.assertEqual(discovery.app_bundle_root(FRAMEWORK_PYTHON), "")
+        self.assertEqual(discovery.app_bundle_root("/opt/homebrew/bin/node"), "")
+
     def test_roll_up_stops_beyond_eight_generations(self):
         rows = [(100, 1, UID, CLAUDE_LOCAL)]
         parent = 100
@@ -837,6 +954,33 @@ class UnclassifiedHookTests(unittest.TestCase):
 
 
 class WatchGlobTests(unittest.TestCase):
+    def test_workbuddy_watches_traces_not_logs_or_heartbeats(self):
+        # 本机空转 120 秒实测：logs/*.log 12 个间隔里变了 8 次（renderer.log
+        # 每几秒就写），sessions/*.json 变了 4 次（整 30 秒一次的心跳），
+        # traces/*/trace_*.json 一次没变。前两个说的是「应用开着」。
+        watch = discovery.DEFAULT_PROFILES["families"]["workbuddy"]["watch"]
+        self.assertEqual(watch, ["traces/*/trace_*.json"])
+
+    def test_default_watch_has_no_log_glob(self):
+        # 同一个陷阱对任何自动学出来的家族都成立。
+        self.assertNotIn("**/*.log", discovery.DEFAULT_WATCH)
+        self.assertFalse([p for p in discovery.DEFAULT_WATCH if p.endswith(".log")])
+
+    def test_a_heartbeat_file_would_pin_the_light_blue(self):
+        # 为什么必须去掉：只要 watch 里有个每轮都在变的文件，quietSince 每轮
+        # 被刷新，now - quietSince 永远 < ACTIVE_MS，busy→idle 那一跳永远不
+        # 发生，绿灯在物理上不可能出现。
+        server._activity.clear()
+        self.addCleanup(server._activity.clear)
+        base = 1_700_000_000_000
+        statuses = []
+        for step in range(12):
+            now = base + step * 5_000
+            # 模拟一个每半秒就被重写的日志文件。
+            quiet = server.note_activity("demo", 0.0, now / 1000.0, now)
+            statuses.append(now - quiet < server.DISCOVERY_ACTIVE_MS)
+        self.assertTrue(all(statuses), "文件一直在动 → 每轮都算 busy")
+
     def test_expand_watch_bounds_the_depth(self):
         self.assertEqual(
             discovery.expand_watch("**/*.jsonl"),
@@ -1053,6 +1197,57 @@ class DiscoveredLightTests(unittest.TestCase):
         self.assertEqual(server.discovered_open_via(item), "")
         agent = self.sample(1_700_000_000_000, item=item)
         self.assertFalse(agent["openable"])
+
+    def test_a_gui_app_light_ignores_the_cpu_signal(self):
+        # 实测 WorkBuddy 空转 24 个 5 秒窗口，11 个越过 CPU_EPSILON、峰值 1.0s。
+        # 留着 CPU 信号，这盏灯会每隔半分钟假装完成一次。
+        gui = candidate(family="workbuddy", label="WorkBuddy", bundle_anywhere=True)
+        base = 1_700_000_000_000
+        seen = set()
+        for step in range(8):
+            # CPU 一路猛涨，但它住在 .app 包里 → 一律当安静。
+            seen.add(self.sample(base + step * 5_000, cpu=float(step), item=gui)["status"])
+        self.assertEqual(seen, {"idle"})
+
+    def test_a_terminal_agent_still_uses_the_cpu_signal(self):
+        cli = candidate(bundle_anywhere=False)
+        base = 1_700_000_000_000
+        self.sample(base, cpu=0.0, item=cli)
+        self.sample(base + 5_000, cpu=1.0, item=cli)
+        self.assertEqual(
+            self.sample(base + 10_000, cpu=2.0, item=cli)["status"], "thinking"
+        )
+
+    def test_a_useless_cwd_does_not_get_pasted_into_the_name(self):
+        # 真机：WorkBuddy 主进程的 cwd 就是 `/`，灯叫「WorkBuddy · /」。
+        item = candidate(family="workbuddy", label="WorkBuddy", home_label="~/.workbuddy")
+        with patch.object(server, "process_cwd", return_value="/"):
+            agent = self.sample(1_700_000_000_000, item=item)
+        self.assertEqual(agent["name"], "WorkBuddy")
+
+    def test_a_member_cwd_is_used_when_the_root_has_none(self):
+        item = candidate(
+            family="workbuddy", label="WorkBuddy", pid=15116, members=(15116, 15890)
+        )
+        cwds = {15116: "/", 15890: "/Users/edy/WorkBuddy/2026-09-07-16-25-42"}
+        with patch.object(server, "process_cwd", side_effect=cwds.get):
+            agent = self.sample(1_700_000_000_000, item=item)
+        self.assertEqual(agent["name"], "WorkBuddy · 2026-09-07-16-25-42")
+
+    def test_bundle_and_temp_cwds_are_not_useful(self):
+        self.assertFalse(server.useful_cwd("/"))
+        self.assertFalse(server.useful_cwd(""))
+        self.assertFalse(
+            server.useful_cwd(
+                "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/x"
+            )
+        )
+        self.assertFalse(
+            server.useful_cwd("/private/var/folders/zn/T/workbuddy-host-cli/x")
+        )
+        # 家目录仍然算数：dsh 那盏「DeepSeek Harness · ~」不该被这条动到。
+        self.assertTrue(server.useful_cwd(str(Path.home())))
+        self.assertTrue(server.useful_cwd("/Users/edy/WorkBuddy/2026-09-07-16-25-42"))
 
     def test_completed_notification_gated_by_min_busy(self):
         base = 1_700_000_000_000
@@ -1281,6 +1476,25 @@ class TeammateSatelliteTests(unittest.TestCase):
         self.assertEqual(
             sorted(satellite), ["completionId", "id", "name", "origin", "status"]
         )
+
+    def test_only_the_claude_family_ever_attaches_to_a_claude_light(self):
+        # `--parent-session-id` 是 Claude 自己的会话 id 约定。别的家族哪怕
+        # 也用这两个参数名，它的值也不是 Claude 的 sessionId。
+        host = claude_light(PARENT_SID)
+        foreign = candidate(
+            family="dsh",
+            label="DeepSeek Harness",
+            agent_name="worker-1",
+            parent_session=PARENT_SID,
+        )
+        self.assertFalse(server.attach_teammate({"id": "x"}, foreign, {PARENT_SID: host}))
+        self.assertEqual(host["satellites"], [])
+        native = candidate(family="claude", agent_name="gh-search", parent_session=PARENT_SID)
+        self.assertTrue(
+            server.attach_teammate({"id": "y", "name": "gh-search", "status": "idle",
+                                    "completionId": 0}, native, {PARENT_SID: host})
+        )
+        self.assertEqual([s["name"] for s in host["satellites"]], ["gh-search"])
 
     def test_an_orphan_teammate_still_gets_its_own_light(self):
         # 父会话不在登记表里：找不到爹不是让一个真在跑的进程凭空消失的理由。

@@ -110,10 +110,25 @@ BUNDLE_RE = re.compile(r"\.app/Contents/")
 
 def in_app_bundle(path: str) -> bool:
     """这段路径是不是住在一个 GUI 应用的 `.app` 包里。"""
+    return bool(app_bundle_root(path))
+
+
+def app_bundle_root(path: str) -> str:
+    """这段路径所属的 GUI 应用包，例如 `/Applications/WorkBuddy.app`；没有就空串。
+
+    解释器自己的壳不算（`…/Python.framework/…/Python.app`）。
+    """
     match = BUNDLE_RE.search(path or "")
     if match is None:
-        return False
-    return ".framework/" not in path[: match.start()]
+        return ""
+    prefix = path[: match.start()]
+    if ".framework/" in prefix:
+        return ""
+    # 路径区可能是「解释器 空格 脚本」，只取最后那条绝对路径。
+    cut = prefix.rfind(" /")
+    if cut != -1:
+        prefix = prefix[cut + 1 :]
+    return f"{prefix}.app"
 
 MAX_ROLL_UP_DEPTH = 8
 DEFAULT_MAX_AGENTS = 24
@@ -135,12 +150,14 @@ SQLITE_PROBE_LIMIT = 12
 
 # watch glob 里的 `**` 展开到的最大深度（深度 ≤ 3，别把整棵树走穿）。
 WATCH_MAX_DEPTH = 3
+# 动态发现的家族默认盯什么。**不含 `*.log`**：日志是「进程活着」的信号，
+# 不是「在干活」的信号——WorkBuddy 的 renderer.log 每半秒就写一次，拿它当
+# 活动信号会让灯永远蓝。这个陷阱对任何自动学出来的家族都成立。
 DEFAULT_WATCH = (
     "**/*.jsonl",
     "**/*.sqlite*",
     "**/*.db",
     "**/*.json",
-    "**/*.log",
 )
 
 
@@ -321,7 +338,13 @@ DEFAULT_PROFILES: dict[str, Any] = {
             25,
             paths=["/Applications/WorkBuddy.app/"],
             home="~/.workbuddy",
-            watch=["sessions/*.json", "logs/*.log", "traces/*/trace_*.json"],
+            # 只留 traces。本机空转 120 秒实测：`logs/*.log` 每几秒就写一次
+            # （renderer.log / daemon.log，Electron 一直在写），`sessions/*.json`
+            # 每 30 秒整点重写一次（lastHeartbeat 心跳）。这两个说的是「应用
+            # 开着」，不是「agent 在干活」；把它们当活动信号，quietSince 每轮
+            # 都被刷新，灯永远蓝、绿灯在物理上不可能出现。同一段时间里
+            # `traces/*/trace_*.json` 一次没动过（上次写入是 7 分钟前那次真任务）。
+            watch=["traces/*/trace_*.json"],
             open_with={"app": "WorkBuddy"},
         ),
     },
@@ -331,6 +354,13 @@ DEFAULT_PROFILES: dict[str, Any] = {
             "AMPLibraryAgent",
             "CursorUIViewService",
             "CodexBar",
+            # 崩溃上报器永远不是 agent。它住在应用包里（于是命中种子的路径
+            # 片段），又常被 macOS 重挂到 launchd（于是 roll-up 够不着），
+            # 真机上 WorkBuddy 就因此多出了一整盏灯。Chrome / Lark /
+            # ChatGPT.app 的 crashpad 同理。
+            "chrome_crashpad_handler",
+            "crashpad_handler",
+            "browser_crashpad_handler",
         ],
         "pathContains": ["Battle.net"],
         # 这些点目录永远不推成家族名（缓存、包管理器、编辑器、面板自己的邻居）。
@@ -389,6 +419,11 @@ class Argv(NamedTuple):
     # 剥出来的 `claude` 不许点亮原生 Claude 分区。
     weak_names: frozenset
     region: str
+    # 路径区最后一段的名字。带空格的 `.app` 路径切不出正确的 argv[0]
+    # （`/Applications/WorkBuddy.app/Contents/Frameworks/Electron Framework.framework/
+    # Helpers/chrome_crashpad_handler` 切出来是 `/Applications/WorkBuddy`），
+    # 黑名单要认的正是最后那一段。
+    region_basename: str
     # 身份文件在不在 GUI 应用包里——种子表的 basename 匹配看这个。
     in_bundle: bool
     # exe 与脚本**任一**在 GUI 应用包里——dotdir 规则与「点得开吗」看这个。
@@ -520,6 +555,7 @@ def parse_argv(command: str) -> Argv:
         names=names,
         weak_names=frozenset(weak),
         region=region,
+        region_basename=region.rsplit("/", 1)[-1] if "/" in region else "",
         in_bundle=script_in_bundle if (interpreter and script) else exe_in_bundle,
         bundle_anywhere=exe_in_bundle or script_in_bundle,
     )
@@ -590,7 +626,7 @@ def excluded(argv: Argv, command: str, uid: Any, own_uid: int, ignore: dict) -> 
         if marker in command:
             return f"helper 进程（{marker}）"
     for name in ignore.get("basenames") or ():
-        if name and name == argv.basename:
+        if name and name in (argv.basename, argv.region_basename):
             return f"黑名单 basename：{name}"
     for fragment in ignore.get("pathContains") or ():
         if fragment and fragment in command:
@@ -947,6 +983,84 @@ def roll_up(
 # ---------------------------------------------------------------------------
 
 
+def _oldest(pids: Iterable[int], starts: dict[Any, Any]) -> int:
+    """一组 pid 里最老的那个；start_s 不知道的排最后，平手比 pid。"""
+    def rank(pid: int) -> tuple[int, int, int]:
+        start = _start_of(starts, pid)
+        return (1, 0, pid) if start is None else (0, start, pid)
+
+    return sorted(pids, key=rank)[0]
+
+
+def merge_same_bundle(
+    members: dict[int, list[int]],
+    matched: dict[int, tuple],
+    commands: dict[Any, str],
+    starts: dict[Any, Any],
+) -> dict[int, list[int]]:
+    """同一个 GUI 应用包里的同家族进程收成一盏灯，不靠父子链。
+
+    macOS 会把 helper 重挂到 launchd（真机上 WorkBuddy 的 crashpad 就是
+    `ppid = 1`），父子链在这种时候是断的，roll-up 够不着。按「同 family +
+    同 `.app` 包」再并一次，根取最老的那个。
+    """
+    groups: dict[tuple, list[int]] = {}
+    loose: dict[int, list[int]] = {}
+    for root, pids in members.items():
+        bundle = app_bundle_root(parse_argv(commands[root]).region)
+        if not bundle:
+            loose[root] = pids
+            continue
+        groups.setdefault((matched[root][0], bundle), []).append(root)
+
+    merged = dict(loose)
+    for roots in groups.values():
+        keeper = _oldest(roots, starts)
+        combined: list[int] = []
+        for root in roots:
+            combined.extend(members[root])
+        merged[keeper] = sorted(set(combined))
+    return merged
+
+
+def absorb_seeded_dotdirs(
+    members: dict[int, list[int]],
+    matched: dict[int, tuple],
+    seeded: Iterable[str],
+    starts: dict[Any, Any],
+) -> dict[int, list[int]]:
+    """dotdir 规则推出来的候选，绝不给「已经有种子画像的家族」另立门户。
+
+    真机上 WorkBuddy 开着的时候，两个插件的 MCP server 和一个采集 shell
+    环境的临时 zsh 只是在参数里**提到**了 `~/.workbuddy/`，就各自点亮了一盏
+    灯。它们不是 agent，但确实属于 WorkBuddy：并进那盏灯（当成员，不出灯）；
+    那盏灯不在时直接丢掉——一个只会提目录名的旁观者，不该冒充这个家族。
+
+    非种子家族（`~/.fakeagent` 这种现学的）不受影响，照旧自己出灯。
+    """
+    seeded_keys = {str(key) for key in seeded}
+    hosts: dict[str, list[int]] = {}
+    for root in members:
+        family, _label, source, _home = matched[root]
+        if source == "seed" and family in seeded_keys:
+            hosts.setdefault(family, []).append(root)
+
+    merged: dict[int, list[int]] = {}
+    absorbed: dict[int, list[int]] = {}
+    for root, pids in members.items():
+        family, _label, source, _home = matched[root]
+        if source != "dotdir" or family not in seeded_keys:
+            merged[root] = pids
+            continue
+        candidates = hosts.get(family)
+        if candidates:
+            absorbed.setdefault(_oldest(candidates, starts), []).extend(pids)
+        # 没有那盏灯就整条丢掉，不进 merged。
+    for host, pids in absorbed.items():
+        merged[host] = sorted(set(merged.get(host, []) + pids))
+    return merged
+
+
 def expand_watch(pattern: str, max_depth: int = WATCH_MAX_DEPTH) -> tuple[str, ...]:
     """把 `**/x` 展开成有限层数的普通 glob，别让 rglob 走穿整棵树。"""
     if "**/" not in pattern:
@@ -1029,6 +1143,10 @@ def classify(
     members = roll_up(
         {pid: entry[0] for pid, entry in matched.items()}, parents
     )
+    # 父子链之外还有两条并线：同一个 App 包里的同族进程收成一盏；dotdir 推出
+    # 来的旁观者并进已有种子家族的那盏灯，没有就丢掉。
+    members = merge_same_bundle(members, matched, commands, starts)
+    members = absorb_seeded_dotdirs(members, matched, families, starts)
     candidates: list[Candidate] = []
     for root, pids in members.items():
         family, label, source, found_home = matched[root]
