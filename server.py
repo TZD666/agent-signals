@@ -1508,8 +1508,10 @@ def discovered_open_via(candidate: Any) -> str:
     if not isinstance(spec, dict):
         return ""
     if spec.get("tty"):
-        # `.app` 包里的进程没有可切过去的 Terminal 标签页，别假装能开。
-        return "" if candidate.in_bundle else "tty"
+        # GUI 应用包里的进程没有可切过去的 Terminal 标签页，别假装能开：
+        # 假装的代价是点击时 terminal_tty 抛错走 500，而 500 发生在
+        # acknowledge_agent 之前，那盏绿灯就再也清不掉了。
+        return "" if candidate.bundle_anywhere else "tty"
     port = spec.get("url")
     if isinstance(port, int) and 0 < port < 65_536:
         return f"url:{port}" if port_listening(port) else ""
@@ -1580,6 +1582,12 @@ def discovered_agent(
     busy_for = completed_at - busy_since if completed_at and busy_since else 0
     open_via = discovered_open_via(candidate)
     home_note = f" · {candidate.home_label}" if candidate.home_label else ""
+    detail = f"自动发现{home_note}"
+    if DESKTOP_COMMAND_MARKER in candidate.command:
+        # 桌面 App 自带的那个二进制：登记表没写时也要认得出来是哪种会话，
+        # 而且它点得开——`open -a Claude`，不是去找一个并不存在的终端标签页。
+        detail = "桌面 App"
+        open_via = "app:Claude"
     cwd = process_cwd(candidate.pid)
     agent = {
         "id": agent_id,
@@ -1587,7 +1595,7 @@ def discovered_agent(
         "platform": candidate.family,
         "name": f"{candidate.label} · {cwd_label(cwd)}",
         "status": status,
-        "detail": f"自动发现{home_note}",
+        "detail": detail,
         "cwd": cwd,
         "cwdLabel": cwd_label(cwd),
         "updatedAt": quiet_since,
@@ -1631,6 +1639,7 @@ def load_discovered(
         Path.home(),
         os.getuid(),
         DISCOVERY_MAX_AGENTS,
+        native=[spec.key for spec in SOURCES],
     )
     _discovery_unclassified[:] = result.unclassified
 
@@ -3728,6 +3737,25 @@ def open_codex(agent: dict[str, Any]) -> None:
         raise RuntimeError(result.stderr.strip() or "无法打开 Codex 任务")
 
 
+def opener_for(
+    platform: str, agent: dict[str, Any]
+) -> Callable[[dict[str, Any]], None] | None:
+    """谁来开这盏灯：先看它是哪来的，再看平台。返回 None 表示没有入口。
+
+    发现型的灯（`origin=process`）家族名可能正好撞上一个原生平台 key——终端里
+    跑的 `codex` 就落在 Codex 分区里。但它的 id 是 `pid-启动时刻`，交给 Codex
+    的 open 回调会被当成 thread id 拿去 `open codex://threads/…`，开出来的是
+    一个不存在的任务。灯自己带的 openVia 才是权威。
+    """
+    has_via = bool(str(agent.get("openVia") or ""))
+    if str(agent.get("origin") or "") == "process":
+        return open_discovered if has_via else None
+    spec = source_for(platform)
+    if spec is not None and spec.open is not None:
+        return spec.open
+    return open_discovered if has_via else None
+
+
 def platform_entry(payload: dict[str, Any], key: str) -> dict[str, Any] | None:
     return next(
         (
@@ -3893,14 +3921,7 @@ class Handler(BaseHTTPRequestHandler):
         if not agent:
             self.send_json({"error": "会话已经离线"}, 404)
             return
-        # 原生源用自己登记的 open 回调；自动发现的平台按灯上的 openVia 分派。
-        # 两样都没有的灯（没有可切窗口的入口）直接落到下面的确认分支。
-        spec = source_for(platform)
-        opener: Callable[[dict[str, Any]], None] | None = None
-        if spec is not None and spec.open is not None:
-            opener = spec.open
-        elif str(agent.get("openVia") or ""):
-            opener = open_discovered
+        opener = opener_for(platform, agent)
         opened = False
         if opener is not None and agent.get("openable"):
             try:

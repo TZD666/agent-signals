@@ -56,14 +56,31 @@ def is_interpreter(basename: str) -> bool:
     name = basename.lower()
     return name in INTERPRETERS or bool(PYTHON_RE.match(name))
 
-# `.app` 包里的可执行文件只允许种子里写死的路径命中：Electron 应用的主程序
-# 常常就叫 `Electron`/`Helper`，靠 basename 或 dotdir 猜必然误伤。
+# GUI 应用 `.app` 包里的可执行文件只允许种子里写死的路径命中：Electron 应用的
+# 主程序常常就叫 `Electron`/`Helper`，靠 basename 或 dotdir 猜必然误伤。
 #
-# 判据看的是「真正说明身份的那个文件」：argv[0] 是解释器时看脚本。Homebrew
-# 与系统的 python3 都住在 `…/Python.app/Contents/MacOS/Python`，照 argv[0] 判
-# 会把所有 python 写的 agent 一并豁免掉——`python3 ~/.fakeagent/run.py` 实测
-# 就是这么消失的。
+# 两个坑，都是真机 ps 逼出来的：
+#
+# 1. 判据**不能用空格切出来的 argv[0]**。ps 把 argv 用空格拼平了，
+#    `/Applications/Google Chrome.app/…` 切出来的第一个 token 是
+#    `/Applications/Google`，标记永远不匹配——真机 981 行 ps 里有 44 个进程
+#    命令含 `.app/Contents/`，照 token 判会有一大半漏网。所以在整段路径文本上
+#    用正则找。
+# 2. 解释器自己的 bundle **不算** GUI 应用。macOS 上 Homebrew 与系统的 python
+#    都住在 `…/Python.framework/…/Resources/Python.app/Contents/MacOS/Python`，
+#    把它算进来会把所有 python 写的 agent 一并豁免掉（`python3
+#    ~/.fakeagent/run.py` 实测就是这么消失的）。判据：第一个 `.app/Contents/`
+#    之前的那段路径里有没有 `.framework/`。
 BUNDLE_MARKER = ".app/Contents/"
+BUNDLE_RE = re.compile(r"\.app/Contents/")
+
+
+def in_app_bundle(path: str) -> bool:
+    """这段路径是不是住在一个 GUI 应用的 `.app` 包里。"""
+    match = BUNDLE_RE.search(path or "")
+    if match is None:
+        return False
+    return ".framework/" not in path[: match.start()]
 
 MAX_ROLL_UP_DEPTH = 8
 DEFAULT_MAX_AGENTS = 24
@@ -336,7 +353,12 @@ class Argv(NamedTuple):
     target: str
     names: tuple[str, ...]
     region: str
+    # 身份文件在不在 GUI 应用包里——种子表的 basename 匹配看这个。
     in_bundle: bool
+    # exe 与脚本**任一**在 GUI 应用包里——dotdir 规则与「点得开吗」看这个。
+    # 两者分开是必需的：某个 GUI 应用用自带的 node 跑一个 `~/.foo/x.mjs`，
+    # 脚本不在包里，但这个进程仍然不该按 `.foo` 推出一个家族来。
+    bundle_anywhere: bool
 
 
 @dataclass
@@ -356,7 +378,8 @@ class Candidate:
     exe: str
     command: str
     start_s: int | None
-    in_bundle: bool = False
+    # exe 或脚本任一住在 GUI 应用包里：这种进程没有可切过去的终端标签页。
+    bundle_anywhere: bool = False
     members: tuple[int, ...] = ()
 
 
@@ -428,6 +451,16 @@ def parse_argv(command: str) -> Argv:
     else:
         names = (basename,)
 
+    # exe 那一段要从整段路径文本里取（带空格的 `.app` 路径没法靠 token 还原），
+    # 脚本 token 之前的部分就是它。
+    if script:
+        cut = region.find(script)
+        exe_region = region[:cut] if cut > 0 else region
+    else:
+        exe_region = region
+    exe_in_bundle = in_app_bundle(exe_region)
+    script_in_bundle = in_app_bundle(script)
+
     target = script if (interpreter and script) else exe
     return Argv(
         exe=exe,
@@ -436,7 +469,8 @@ def parse_argv(command: str) -> Argv:
         target=target,
         names=names,
         region=region,
-        in_bundle=BUNDLE_MARKER in target,
+        in_bundle=script_in_bundle if (interpreter and script) else exe_in_bundle,
+        bundle_anywhere=exe_in_bundle or script_in_bundle,
     )
 
 
@@ -511,10 +545,17 @@ def _ancestor_claimed(
 # ---------------------------------------------------------------------------
 
 
-def match_seed(argv: Argv, families: dict[str, Any]) -> str:
+def match_seed(
+    argv: Argv, families: dict[str, Any], native: Iterable[str] = ()
+) -> str:
     """种子表精确匹配；返回 family key，没命中返回空串。
 
-    先过一轮路径片段（信号强，`.app` 里的 exe 只认这一条），再过 basename。
+    先过一轮路径片段（信号强，GUI 应用包里的 exe 只认这一条），再过 basename。
+
+    `native` 是有原生数据源的平台 key。解释器 + 脚本时，能拿来比的只有脚本去掉
+    后缀的名字，那是**弱证据**：`python3 ~/work/claude.py` 会命中 `claude`，在
+    原生 Claude 分区里冒出一盏 tty 可点的假灯（而 `./claude.py` 直接跑反倒不会，
+    自己都不自洽）。所以原生平台只认真正的可执行文件名。
     """
     ordered = sorted(families.items())
     for key, profile in ordered:
@@ -523,10 +564,14 @@ def match_seed(argv: Argv, families: dict[str, Any]) -> str:
                 return key
     if argv.in_bundle:
         return ""
+    native_keys = {str(key) for key in native}
     for key, profile in ordered:
         for name in ((profile.get("match") or {}).get("basenames") or ()):
-            if name and name in argv.names:
-                return key
+            if not name or name not in argv.names:
+                continue
+            if argv.script and key in native_keys:
+                continue
+            return key
     return ""
 
 
@@ -714,10 +759,12 @@ def match_dotdir(
     home 只有这里知道；少了它就既没有活动信号（watch mtime），detail 里
     也写不出「自动发现 · ~/.<name>」。
 
-    `.app` 包里的 exe 不适用（Electron 应用的 dotdir 只出现在 helper 里，
-    照这条推会把浏览器、聊天软件全推成 agent）。
+    GUI 应用包里的进程不适用（Electron 应用的 dotdir 只出现在 helper 里，
+    照这条推会把浏览器、聊天软件全推成 agent）。这里看的是 `bundle_anywhere`
+    而不是身份文件：某个 GUI 应用用自带的 node 跑一个 `~/.foo/x.mjs`，脚本
+    本身不在包里，但它照样不该推出一个 `foo` 家族来。
     """
-    if argv.in_bundle:
+    if argv.bundle_anywhere:
         return NO_DOTDIR
     ignored = {str(name).lower() for name in (ignore.get("dotdirs") or ())}
     rejected: list[str] = []
@@ -746,12 +793,26 @@ def match_dotdir(
 
 
 def roll_up(
-    matched: Iterable[int], parents: dict[int, int], depth: int = MAX_ROLL_UP_DEPTH
+    matched: dict[int, str],
+    parents: dict[int, int],
+    depth: int = MAX_ROLL_UP_DEPTH,
 ) -> dict[int, list[int]]:
-    """候选的祖先（≤ depth 层）也是候选就并进祖先；返回 `根 pid → 成员列表`。"""
+    """候选的祖先（≤ depth 层）也是**同一个家族**的候选就并进祖先。
+
+    `matched` 是 `pid → family`，返回 `根 pid → 成员列表`。
+
+    只并同族是刻意的：`claude` 拉起一个 `codex exec` 是这台机器上的日常主力
+    工作流，不看家族地并会把 codex 那盏灯整个吃掉，这条路上永远看不到它。
+    WorkBuddy 的验收（「出现且只有一盏灯」）不受影响——它的成员
+    `sidecar-entry.js`（`.app` 路径片段）与 `sandbox-center`（dotdir）都解析
+    到 `workbuddy`。
+
+    只看**最近的那个**候选祖先：中间隔着一个异族候选时不再往上找，跨过一层
+    别人的进程去认亲说不通。
+    """
     members: dict[int, list[int]] = {}
-    matched_set = {int(pid) for pid in matched}
-    for pid in sorted(matched_set):
+    families = {int(pid): str(family) for pid, family in matched.items()}
+    for pid in sorted(families):
         root = pid
         seen = {pid}
         while True:
@@ -760,11 +821,13 @@ def roll_up(
             for _ in range(depth):
                 if current <= 0:
                     break
-                if current in matched_set:
+                if current in families:
                     found = current
                     break
                 current = parents.get(current, 0)
             if not found or found in seen:
+                break
+            if families[found] != families[pid]:
                 break
             seen.add(found)
             root = found
@@ -821,6 +884,7 @@ def classify(
     uid: int,
     max_agents: int = DEFAULT_MAX_AGENTS,
     now: float | None = None,
+    native: Iterable[str] = (),
 ) -> ClassifyResult:
     """一份 ps 表 → 候选家族列表 + 「考察过但没认出来」的进程列表。"""
     families = profiles.get("families") or {}
@@ -844,7 +908,7 @@ def classify(
             continue
         if pid in claimed or _ancestor_claimed(pid, parents, claimed):
             continue
-        family = match_seed(argv, families)
+        family = match_seed(argv, families, native)
         if family:
             label = str(families[family].get("label") or family_label(family))
             matched[pid] = (family, label, "seed", "")
@@ -857,7 +921,9 @@ def classify(
             Unclassified(pid, argv.exe, found.reason or "没有任何规则命中")
         )
 
-    members = roll_up(matched, parents)
+    members = roll_up(
+        {pid: entry[0] for pid, entry in matched.items()}, parents
+    )
     candidates: list[Candidate] = []
     for root, pids in members.items():
         family, label, source, found_home = matched[root]
@@ -883,7 +949,7 @@ def classify(
                 exe=argv.exe,
                 command=commands[root],
                 start_s=_start_of(starts, root),
-                in_bundle=argv.in_bundle,
+                bundle_anywhere=argv.bundle_anywhere,
                 members=tuple(pids),
             )
         )

@@ -75,8 +75,11 @@ printf '[1/4] 跑测试（%s）\n' "$PYTHON"
 
 printf '[2/4] 拷文件到 %s\n' "$DEPLOY_DIR"
 install_file "server.py" "$DEPLOY_DIR"
+# discovery.py 自 2.3.0 起是必需的：server.py 启动时按路径加载它，缺了就起不来。
+# 宁可在拷文件这一步炸，也别让服务在 launchd 里反复起不来。
+install_file "discovery.py" "$DEPLOY_DIR"
 # 后续阶段才会出现的模块：有才拷。
-for optional in discovery.py cloud.py; do
+for optional in cloud.py; do
   if [[ -f "$optional" ]]; then
     install_file "$optional" "$DEPLOY_DIR"
   fi

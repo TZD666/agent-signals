@@ -12,7 +12,10 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from unittest.mock import Mock, patch
 
 REPO = Path(__file__).parents[1]
@@ -60,6 +63,13 @@ CLAUDE_APP_CRASHPAD = (
     "/Applications/Claude.app/Contents/Frameworks/Electron Framework.framework/"
     "Helpers/chrome_crashpad_handler --no-rate-limit "
     "--database=/Users/edy/Library/Application Support/Claude/Crashpad"
+)
+CHROME_MAIN = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+)
+FRAMEWORK_PYTHON = (
+    "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/"
+    "Versions/3.14/Resources/Python.app/Contents/MacOS/Python"
 )
 CHROME_HELPER = (
     "/Applications/Google Chrome.app/Contents/Frameworks/"
@@ -186,9 +196,44 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(argv.script, "/Users/edy/.fakeagent/run.py")
         self.assertEqual(argv.names, ("run",))
         self.assertFalse(argv.in_bundle)
+        # 解释器自己的 bundle 不是 GUI 应用：连 bundle_anywhere 都不该亮，
+        # 否则 dotdir 规则会把所有 python 写的 agent 一并豁免掉。
+        self.assertFalse(argv.bundle_anywhere)
         self.assertTrue(discovery.is_interpreter("Python"))
         self.assertTrue(discovery.is_interpreter("python3.14"))
         self.assertFalse(discovery.is_interpreter("pythonista"))
+
+    def test_bundle_flag_survives_spaces_in_the_app_path(self):
+        # ps 把 argv 用空格拼平了：`command.split()[0]` 得到的是
+        # `/Applications/Google`，`.app/Contents/` 永远匹配不上。这道保险
+        # 之前从来没生效过。
+        argv = discovery.parse_argv(CHROME_MAIN)
+        self.assertEqual(argv.exe, "/Applications/Google")
+        self.assertNotIn(discovery.BUNDLE_MARKER, argv.exe)
+        self.assertTrue(argv.in_bundle)
+        self.assertTrue(argv.bundle_anywhere)
+
+    def test_in_app_bundle_tells_gui_apps_from_interpreter_bundles(self):
+        self.assertTrue(discovery.in_app_bundle(CHROME_MAIN))
+        self.assertTrue(discovery.in_app_bundle(CHATGPT_APP))
+        self.assertTrue(discovery.in_app_bundle(CLAUDE_DESKTOP_BUNDLED))
+        self.assertTrue(discovery.in_app_bundle(CLAUDE_APP_CRASHPAD))
+        # Python.app 住在 Python.framework 里，是解释器自己的壳，不是 GUI 应用。
+        self.assertFalse(discovery.in_app_bundle(FRAMEWORK_PYTHON))
+        self.assertFalse(discovery.in_app_bundle(PANEL.split()[0]))
+        self.assertFalse(discovery.in_app_bundle("/opt/homebrew/bin/node"))
+        self.assertFalse(discovery.in_app_bundle(""))
+
+    def test_gui_app_interpreter_running_a_user_script_is_bundled_anywhere(self):
+        # 某个 GUI 应用用自带的 node 跑一个 ~/.foo/x.mjs：脚本不在包里，
+        # 但这个进程照样不该按 .foo 推出一个家族来。
+        command = (
+            "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node "
+            "/Users/edy/.fakeagent/x.mjs"
+        )
+        argv = discovery.parse_argv(command)
+        self.assertFalse(argv.in_bundle)
+        self.assertTrue(argv.bundle_anywhere)
 
     def test_parse_argv_plain_binary(self):
         argv = discovery.parse_argv(CLAUDE_LOCAL_HEADLESS)
@@ -240,6 +285,39 @@ class SeedMatchTests(unittest.TestCase):
         self.assertEqual(by_family["dsh"].open, {"url": 3080})
         self.assertEqual(by_family["dsh"].home_label, "~/.dsh")
         self.assertIsNone(by_family["openclaw"].open)
+
+    def test_script_stem_never_matches_a_native_family(self):
+        # `python3 ~/work/claude.py` 以前会命中 claude，在原生 Claude 分区里
+        # 冒出一盏 tty 可点的假灯。这个用户满机器都是自己写的脚本。
+        rows = [(8001, 1, UID, "python3 /Users/edy/work/claude.py")]
+        native = [spec.key for spec in server.SOURCES]
+        result = discovery.classify(
+            table(rows),
+            discovery.DEFAULT_PROFILES,
+            discovery.DEFAULT_PROFILES["ignore"],
+            set(),
+            HOME,
+            UID,
+            native=native,
+        )
+        self.assertEqual(result.candidates, [])
+        # 不给 native 时（纯模块单跑）才是老行为，非原生家族仍然认脚本名。
+        self.assertEqual(families(run(rows)), ["claude"])
+        hermes = [(8002, 1, UID, "python3 /Users/edy/work/hermes.py")]
+        self.assertEqual(
+            families(
+                discovery.classify(
+                    table(hermes),
+                    discovery.DEFAULT_PROFILES,
+                    discovery.DEFAULT_PROFILES["ignore"],
+                    set(),
+                    HOME,
+                    UID,
+                    native=native,
+                )
+            ),
+            ["hermes"],
+        )
 
     def test_bare_amp_or_pi_basename_not_enough(self):
         # `amp` / `pi` 这种裸名太容易撞车，种子里故意不给 basename。
@@ -459,6 +537,33 @@ class DotdirTests(unittest.TestCase):
         self.assertEqual(result.candidates[0].label, "WorkBuddy")
         self.assertEqual(result.candidates[0].source, "dotdir")
 
+    def test_gui_app_bundled_interpreter_never_infers_a_dotdir_family(self):
+        # 反向的洞：脚本不在包里，身份判据（in_bundle）就是 False，
+        # 光看它的话 `~/.fakeagent` 会被推成一个家族。
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".fakeagent").mkdir()
+            (home / ".fakeagent" / "sessions").mkdir()
+            gui = (
+                "/Applications/SomeApp.app/Contents/Resources/node "
+                f"{home}/.fakeagent/x.mjs"
+            )
+            plain = f"/opt/homebrew/bin/node {home}/.fakeagent/x.mjs"
+
+            def classify(command, pid):
+                return discovery.classify(
+                    table([(pid, 1, UID, command)]),
+                    discovery.DEFAULT_PROFILES,
+                    discovery.DEFAULT_PROFILES["ignore"],
+                    set(),
+                    home,
+                    UID,
+                )
+
+            self.assertEqual(classify(gui, 900).candidates, [])
+            # 同一个脚本换个正常的 node 跑就该出来，证明拦掉它的是 GUI 包。
+            self.assertEqual(families(classify(plain, 901)), ["fakeagent"])
+
     def test_app_bundle_exe_never_uses_the_dotdir_rule(self):
         # Claude.app 的 crashpad helper 命令里带 ~/Library/Application Support/Claude/，
         # 照 dotdir 规则推会推成 claude 家族——.app 里的 exe 必须豁免。
@@ -498,6 +603,29 @@ class RollUpTests(unittest.TestCase):
         self.assertEqual(candidate.pid, 93850)
         self.assertEqual(candidate.family, "workbuddy")
         self.assertEqual(candidate.members, (93850, 93860, 93870))
+
+    def test_roll_up_only_merges_the_same_family(self):
+        # 这台机器的日常主力工作流就是 claude 拉一个 codex exec。
+        # 不看家族地并会把 codex 那盏灯整个吃掉，这条路上永远看不到它。
+        rows = [
+            (100, 1, UID, CLAUDE_LOCAL),
+            (200, 100, UID, "/opt/homebrew/bin/codex exec 修一下这个 bug"),
+        ]
+        result = run(rows)
+        self.assertEqual(families(result), ["claude", "codex"])
+        by_pid = {c.pid: c for c in result.candidates}
+        self.assertEqual(by_pid[100].members, (100,))
+        self.assertEqual(by_pid[200].members, (200,))
+
+    def test_roll_up_does_not_reach_across_a_foreign_candidate(self):
+        rows = [
+            (100, 1, UID, CLAUDE_LOCAL),
+            (200, 100, UID, "/opt/homebrew/bin/codex exec x"),
+            (300, 200, UID, CLAUDE_LOCAL),
+        ]
+        result = run(rows)
+        # 中间隔着一个异族候选，不再往上认亲：三盏灯。
+        self.assertEqual(sorted(c.pid for c in result.candidates), [100, 200, 300])
 
     def test_roll_up_stops_beyond_eight_generations(self):
         rows = [(100, 1, UID, CLAUDE_LOCAL)]
@@ -567,6 +695,29 @@ class WatchGlobTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # server 侧：DiscoveredSource 的状态机
 # ---------------------------------------------------------------------------
+
+
+def discovered_light(platform, **overrides):
+    """载荷里的一盏发现型的灯（`origin: "process"`）。"""
+    light = {
+        "id": "7777-1699996400",
+        "pid": 7777,
+        "platform": platform,
+        "name": "x",
+        "status": "completed",
+        "detail": "自动发现",
+        "cwd": "",
+        "cwdLabel": "未知目录",
+        "updatedAt": 1_000,
+        "quietSince": 1_000,
+        "completionId": 4,
+        "openable": True,
+        "origin": "process",
+        "openVia": "tty",
+        "satellites": [],
+    }
+    light.update(overrides)
+    return light
 
 
 def candidate(**overrides):
@@ -717,6 +868,39 @@ class DiscoveredLightTests(unittest.TestCase):
         self.assertEqual(agent["name"], "DeepSeek Harness · work")
         self.assertEqual(agent["platform"], "dsh")
 
+    def test_desktop_bundled_claude_is_labelled_and_opens_the_app(self):
+        # 验收项 (e)：登记表没写时，桌面会话也要经捆绑路径规则出现在 Claude
+        # 分区并标「桌面 App」。它同时是一颗地雷：这盏灯以前 openVia='tty'，
+        # 点下去 terminal_tty 抛错走 500，而 500 发生在 acknowledge_agent
+        # 之前，绿灯就再也清不掉了。
+        desktop = candidate(
+            family="claude",
+            label="Claude",
+            command=CLAUDE_DESKTOP_BUNDLED,
+            exe=CLAUDE_DESKTOP_BUNDLED,
+            home_label="~/.claude",
+            open={"tty": True},
+            bundle_anywhere=True,
+        )
+        agent = self.sample(1_700_000_000_000, item=desktop)
+        self.assertEqual(agent["detail"], "桌面 App")
+        self.assertEqual(agent["openVia"], "app:Claude")
+        self.assertTrue(agent["openable"])
+        self.assertEqual(agent["platform"], "claude")
+        self.assertEqual(agent["origin"], "process")
+        # 这条 openVia 必须真的能开——`open -a` 的白名单里有 Claude。
+        with patch.object(
+            server.subprocess, "run", return_value=Mock(returncode=0)
+        ) as run_:
+            server.open_discovered(agent)
+        self.assertEqual(run_.call_args[0][0], ["open", "-a", "Claude"])
+
+    def test_gui_bundle_light_is_never_promised_a_terminal_tab(self):
+        item = candidate(open={"tty": True}, bundle_anywhere=True)
+        self.assertEqual(server.discovered_open_via(item), "")
+        agent = self.sample(1_700_000_000_000, item=item)
+        self.assertFalse(agent["openable"])
+
     def test_completed_notification_gated_by_min_busy(self):
         base = 1_700_000_000_000
         self.sample(base)
@@ -814,7 +998,7 @@ class DiscoveredOpenTests(unittest.TestCase):
         # .app 包里的进程没有可切过去的 Terminal 标签页。
         self.assertEqual(
             server.discovered_open_via(
-                candidate(open={"tty": True}, in_bundle=True)
+                candidate(open={"tty": True}, bundle_anywhere=True)
             ),
             "",
         )
@@ -835,6 +1019,126 @@ class DiscoveredOpenTests(unittest.TestCase):
             with patch.object(server, "STATE_PATH", Path(directory) / "state.json"):
                 server._acknowledged_completions.clear()
                 self.assertTrue(server.acknowledge_agent(agent))
+
+
+class OpenerRoutingTests(unittest.TestCase):
+    """发现型的灯撞上原生 platform key 时，谁来开它。"""
+
+    def test_discovered_light_on_a_native_key_uses_its_own_opener(self):
+        # 终端里跑的 codex 就落在 Codex 分区里，但它的 id 是 pid-启动时刻。
+        # 交给 Codex 的回调会变成 `open codex://threads/7777-1699996400`。
+        light = discovered_light("codex")
+        self.assertIs(server.opener_for("codex", light), server.open_discovered)
+        light = discovered_light("claude")
+        self.assertIs(server.opener_for("claude", light), server.open_discovered)
+
+    def test_registry_light_still_uses_the_native_opener(self):
+        # 注册表里的 open 是个 lambda，只能按行为验：谁最终被调到。
+        registry = {"id": "sid-1", "pid": 42, "origin": "registry", "openVia": "tty"}
+        for platform, name in (("claude", "open_claude"), ("codex", "open_codex")):
+            with patch.object(server, name) as native:
+                server.opener_for(platform, registry)(registry)
+            native.assert_called_once_with(registry)
+        # 没有 origin 的老形状按原生走，行为不变。
+        legacy = {"id": "t"}
+        with patch.object(server, "open_codex") as native:
+            server.opener_for("codex", legacy)(legacy)
+        native.assert_called_once_with(legacy)
+
+    def test_light_without_an_entrance_has_no_opener(self):
+        self.assertIsNone(
+            server.opener_for("fakeagent", discovered_light("fakeagent", openVia=""))
+        )
+        self.assertIsNone(server.opener_for("fakeagent", {"id": "x"}))
+
+
+class OpenEndpointTests(unittest.TestCase):
+    """走真的 HTTP，确认路由没被原生 opener 截胡。"""
+
+    def setUp(self):
+        self.payload = {
+            "schemaVersion": 2,
+            "generatedAt": 1_000_000,
+            "version": server.APP_VERSION,
+            "sources": {"codex": {"state": "live", "detail": ""}},
+            "notifications": {"state": "ok", "detail": ""},
+            "platforms": [
+                {
+                    "key": "codex",
+                    "label": "Codex",
+                    "order": 1,
+                    "kind": "local",
+                    "hint": "",
+                    "dismissible": True,
+                    "lockable": True,
+                    "emptyText": "",
+                    "health": {"state": "live", "detail": ""},
+                    "agents": [discovered_light("codex")],
+                }
+            ],
+            "counts": {"agents": 1, "satellites": 0, "byPlatform": {"codex": 1}},
+        }
+        patches = [
+            patch.object(server, "snapshot", return_value=self.payload),
+            patch.object(server, "send_mac_notification"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        server._latest_snapshot = None
+        server._latest_revision = ""
+        server._locked_ids.clear()
+
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        state = patch.object(
+            server, "STATE_PATH", Path(self.directory.name) / "state.json"
+        )
+        state.start()
+        self.addCleanup(state.stop)
+        original = dict(server._acknowledged_completions)
+        self.addCleanup(server._acknowledged_completions.update, original)
+        server._acknowledged_completions.clear()
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        self.port = self.httpd.server_address[1]
+        thread = Thread(target=self.httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def post(self, body):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/open",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        # 本机系统代理会劫持回环，测试必须直连。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=10) as response:
+            return json.loads(response.read())
+
+    def test_discovered_codex_light_opens_a_terminal_not_a_codex_thread(self):
+        with patch.object(server, "open_codex") as codex, patch.object(
+            server, "open_terminal_tab"
+        ) as terminal:
+            body = self.post({"platform": "codex", "id": "7777-1699996400"})
+        codex.assert_not_called()
+        terminal.assert_called_once_with(7777)
+        self.assertEqual(body, {"ok": True, "opened": True, "acknowledged": True})
+
+    def test_an_entranceless_discovered_light_only_acknowledges(self):
+        self.payload["platforms"][0]["agents"] = [
+            discovered_light("codex", openVia="", openable=False)
+        ]
+        with patch.object(server, "open_codex") as codex, patch.object(
+            server, "open_terminal_tab"
+        ) as terminal:
+            body = self.post({"platform": "codex", "id": "7777-1699996400"})
+        codex.assert_not_called()
+        terminal.assert_not_called()
+        self.assertEqual(body, {"ok": True, "opened": False, "acknowledged": True})
 
 
 class FamilyMetaTests(unittest.TestCase):
