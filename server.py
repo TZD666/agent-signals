@@ -36,7 +36,7 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
-APP_VERSION = "2.3.2"
+APP_VERSION = "2.3.3"
 SCHEMA_VERSION = 2
 
 ROOT = Path(__file__).resolve().parent
