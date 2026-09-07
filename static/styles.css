@@ -862,6 +862,19 @@ h2 .platform-hint {
   white-space: nowrap;
 }
 
+/* 自动发现的灯：这盏灯没有任何登记表背书，直说。 */
+.agent-origin {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  margin-top: 2px;
+  color: #4c525b;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .agent-state {
   margin-top: 5px;
   color: rgba(var(--status), 0.94);
@@ -1158,6 +1171,7 @@ footer p {
 
 :root[data-theme="light"] .agent-meta,
 :root[data-theme="light"] .agent-detail,
+:root[data-theme="light"] .agent-origin,
 :root[data-theme="light"] .load-text,
 :root[data-theme="light"] .satellite-overflow {
   color: #737e8f;

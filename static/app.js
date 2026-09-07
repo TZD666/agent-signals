@@ -372,6 +372,7 @@ function cardMarkup(agent, platform) {
         <span class="agent-copy">
           <span class="agent-name" title="${escapeHtml(agent.name)}">${escapeHtml(agent.name)}</span>
           ${agent.detail ? `<span class="agent-detail">${escapeHtml(agent.detail)}</span>` : ""}
+          ${agent.origin === "process" ? `<span class="agent-origin">未登记进程</span>` : ""}
           <span class="agent-state">${escapeHtml(status)}</span>
           ${note ? `<span class="agent-note">${escapeHtml(note)}</span>` : ""}
           ${loadMarkup(agent)}

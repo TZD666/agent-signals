@@ -6,10 +6,13 @@ from __future__ import annotations
 import argparse
 import calendar
 import hashlib
+import importlib.util
 import json
 import os
+import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -33,11 +36,34 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 SCHEMA_VERSION = 2
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
+
+
+def load_sibling(name: str, filename: str) -> Any:
+    """按路径加载同目录的模块。
+
+    server.py 在测试里是被 importlib 从路径喂进来的，运行目录也不一定在
+    sys.path 上，`import discovery` 不可靠。已经加载过同一个文件就复用，
+    这样测试里 patch 到的还是同一个模块对象。
+    """
+    path = ROOT / filename
+    existing = sys.modules.get(name)
+    if existing is not None and getattr(existing, "__file__", "") == str(path):
+        return existing
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - 文件缺失即致命
+        raise ImportError(f"找不到模块文件：{path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+discovery = load_sibling("agent_signals_discovery", "discovery.py")
 CLAUDE_SESSIONS_DIR = Path(
     os.environ.get("CLAUDE_SESSIONS_DIR", "~/.claude/sessions")
 ).expanduser()
@@ -91,6 +117,21 @@ SUBAGENT_LINGER_MS = env_int("AGENT_SIGNALS_SUBAGENT_LINGER_MS", 600_000)
 # 一轮采样内多次取快照时不重复列目录 / 重扫桌面索引。
 SUBAGENT_LIST_TTL_MS = 5_000
 DESKTOP_INDEX_TTL_S = 60.0
+
+# 自动发现（Phase 4）：没有原生数据源的 agent 运行时，靠 ps 表认出来。
+DISCOVERY_ENABLED = os.environ.get("AGENT_SIGNALS_DISCOVERY", "1") != "0"
+DISCOVERY_ACTIVE_MS = env_int("AGENT_SIGNALS_DISCOVERY_ACTIVE_MS", 20_000)
+DISCOVERY_WARMUP_SAMPLES = env_int("AGENT_SIGNALS_DISCOVERY_WARMUP_SAMPLES", 2)
+DISCOVERY_MIN_AGE_S = env_int("AGENT_SIGNALS_DISCOVERY_MIN_AGE_S", 5)
+DISCOVERY_MAX_AGENTS = env_int("AGENT_SIGNALS_DISCOVERY_MAX_AGENTS", 24)
+DISCOVERY_NOTIFY_MIN_BUSY_MS = env_int(
+    "AGENT_SIGNALS_DISCOVERY_NOTIFY_MIN_BUSY_MS", 60_000
+)
+# watch glob 的成本上限：列表 30 秒一刷，一轮最多 stat 50 个文件。
+WATCH_LIST_TTL_S = 30.0
+WATCH_MAX_FILES = 50
+WATCH_SCAN_LIMIT = 400
+PORT_PROBE_TTL_S = 10.0
 # 桌面 App 自带一份 claude 二进制，登记表没写 entrypoint 时只能靠它认。
 DESKTOP_COMMAND_MARKER = "Application Support/Claude/claude-code/"
 
@@ -206,6 +247,14 @@ _claude_load_cache: dict[str, tuple[tuple[float, int], dict[str, Any]]] = {}
 _transcript_paths: dict[str, Path] = {}
 _subagent_cache: dict[str, tuple[int, list[dict[str, Any]]]] = {}
 _desktop_index_cache: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
+# 自动发现的三本账：每盏灯的采样次数与忙起点、闩锁、以及每 pid 一次的 cwd。
+_discovery_state: dict[str, dict[str, int]] = {}
+_discovery_transitions: dict[str, dict[str, Any]] = {}
+_discovery_cwd: dict[int, str] = {}
+# 「考察过但没认出来」的进程：Phase 5 的探针从这里取扫描目标，不进载荷。
+_discovery_unclassified: list[Any] = []
+_watch_cache: dict[str, tuple[float, tuple[Path, ...]]] = {}
+_port_cache: dict[int, tuple[float, bool]] = {}
 _state_lock = threading.Lock()
 
 _snapshot_ready = threading.Condition()
@@ -323,24 +372,30 @@ def parse_cpu_time(value: str) -> float:
     return total
 
 
-def parse_etime(value: str) -> int:
-    """ps 的 etime：`ss` / `mm:ss` / `hh:mm:ss` / `dd-hh:mm:ss`，返回整秒。"""
+def parse_etime(value: str) -> int | None:
+    """ps 的 etime：`ss` / `mm:ss` / `hh:mm:ss` / `dd-hh:mm:ss`，返回整秒。
+
+    解析不了就返回 None（「不知道」），**不是 0**。返回 0 会让 start_s 等于
+    当前时刻，一个跑了三天的 agent 看起来像刚启动，会被年龄门槛永远挡在外面；
+    而且 start_s 每轮都在变，`{pid}-{start_s}` 这个 id 也就没法稳定，304 契约
+    跟着一起坏掉。
+    """
     text = value.strip()
     if not text:
-        return 0
+        return None
     days = 0
     if "-" in text:
         head, _, text = text.partition("-")
         try:
             days = int(head)
         except ValueError:
-            return 0
+            return None
     seconds = 0
     for part in text.split(":"):
         try:
             seconds = seconds * 60 + int(part)
         except ValueError:
-            return 0
+            return None
     return days * 86_400 + seconds
 
 
@@ -378,9 +433,11 @@ def scan_processes() -> dict[str, Any]:
             pid, parent, uid = int(parts[0]), int(parts[1]), int(parts[2])
         except ValueError:
             continue
+        elapsed = parse_etime(parts[4])
         table["cpu"][pid] = parse_cpu_time(parts[3])
         table["children"].setdefault(parent, []).append(pid)
-        table["start_s"][pid] = current_s - parse_etime(parts[4])
+        # etime 认不出来就写 None：宁可说「不知道多老」，也不要谎报「刚启动」。
+        table["start_s"][pid] = None if elapsed is None else current_s - elapsed
         table["uid"][pid] = uid
         table["commands"][pid] = parts[5] if len(parts) > 5 else ""
     _last_table = table
@@ -567,6 +624,27 @@ def cwd_label(cwd: str) -> str:
     return "~" if path == Path.home() else path.name or str(path)
 
 
+def latch_transition(
+    store: dict[str, dict[str, Any]],
+    key: str,
+    raw: str,
+    current_ms: int,
+    busy: tuple[str, ...] = ("busy", "shell"),
+    idle: tuple[str, ...] = ("idle",),
+) -> int:
+    """忙 → 闲的那一刻记成「完成」，并一直闩住直到被确认掉。
+
+    从 claude_status 里抽出来的通用闩锁：Claude 的原始状态词与自动发现的
+    busy/idle 用的是同一套时序，只是词表不同。返回闩住的 completed_at。
+    """
+    previous = store.get(key)
+    completed_at = int(previous.get("completed_at", 0)) if previous else 0
+    if previous and previous.get("raw") in busy and raw in idle:
+        completed_at = current_ms
+    store[key] = {"raw": raw, "completed_at": completed_at}
+    return completed_at
+
+
 def claude_status(
     session_id: str, raw_status: str, alive: bool, updated_at: int, current_ms: int
 ) -> str:
@@ -580,18 +658,9 @@ def claude_status(
     else:
         mapped = "idle"
 
-    previous = _claude_transitions.get(session_id)
-    completed_at = int(previous.get("completed_at", 0)) if previous else 0
-    if (
-        previous
-        and previous.get("raw") in {"busy", "shell"}
-        and raw_status == "idle"
-    ):
-        completed_at = current_ms
-    _claude_transitions[session_id] = {
-        "raw": raw_status,
-        "completed_at": completed_at,
-    }
+    completed_at = latch_transition(
+        _claude_transitions, session_id, raw_status, current_ms
+    )
     return "completed" if mapped == "idle" and completed_at else mapped
 
 
@@ -1333,6 +1402,257 @@ def load_codex_threads(
     return foreground, {"state": "live", "detail": compatibility}
 
 
+# ---------------------------------------------------------------------------
+# 自动发现（Phase 4）
+#
+# discovery.classify() 是纯的：只吃 ps 表与画像字典。这一节负责它够不到的
+# 那一半——活动信号（CPU 增量 / watch 文件 mtime）、状态闩锁、cwd 探测、
+# 打开方式，以及把候选变成一盏标准的灯。
+# ---------------------------------------------------------------------------
+
+
+def watch_files(home: Path, patterns: tuple[str, ...]) -> tuple[Path, ...]:
+    """按 watch glob 挑出要 stat 的文件；列表缓存 30 秒。
+
+    有意做成有上限的：先扫到 WATCH_SCAN_LIMIT 个就停，再按文件名倒序取前
+    WATCH_MAX_FILES 个（带日期的 jsonl / rollout 文件名倒序≈按新到旧）。
+    """
+    key = f"{home}|{'|'.join(patterns)}"
+    stamp = time.monotonic()
+    cached = _watch_cache.get(key)
+    if cached is not None and 0 <= stamp - cached[0] < WATCH_LIST_TTL_S:
+        return cached[1]
+
+    found: list[Path] = []
+    for pattern in patterns:
+        for expanded in discovery.expand_watch(pattern):
+            try:
+                for path in home.glob(expanded):
+                    found.append(path)
+                    if len(found) >= WATCH_SCAN_LIMIT:
+                        break
+            except (OSError, ValueError):
+                continue
+            if len(found) >= WATCH_SCAN_LIMIT:
+                break
+        if len(found) >= WATCH_SCAN_LIMIT:
+            break
+    files = tuple(
+        sorted(set(found), key=lambda path: path.name, reverse=True)[:WATCH_MAX_FILES]
+    )
+    if len(_watch_cache) > 100:
+        _watch_cache.clear()
+    _watch_cache[key] = (stamp, files)
+    return files
+
+
+def watch_mtime(home: str, patterns: tuple[str, ...]) -> float:
+    """这个家族状态目录里最新一次写入的时刻；读不到就是 0。"""
+    if not home:
+        return 0.0
+    newest = 0.0
+    for path in watch_files(Path(home), patterns):
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def port_listening(port: int) -> bool:
+    """本机回环端口有没有人在听；10 秒缓存，别每轮都去连。"""
+    stamp = time.monotonic()
+    cached = _port_cache.get(port)
+    if cached is not None and 0 <= stamp - cached[0] < PORT_PROBE_TTL_S:
+        return cached[1]
+    listening = False
+    try:
+        with socket.create_connection(("127.0.0.1", port), 0.2):
+            listening = True
+    except OSError:
+        listening = False
+    _port_cache[port] = (stamp, listening)
+    return listening
+
+
+def process_cwd(pid: int) -> str:
+    """进程的工作目录；每个 pid 只问一次 lsof，问不到就一直是空。"""
+    cached = _discovery_cwd.get(pid)
+    if cached is not None:
+        return cached
+    cwd = ""
+    try:
+        result = subprocess.run(
+            ["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        for line in result.stdout.splitlines():
+            if line.startswith("n"):
+                cwd = line[1:].strip()
+                break
+    except (OSError, subprocess.SubprocessError):
+        cwd = ""
+    _discovery_cwd[pid] = cwd
+    return cwd
+
+
+def discovered_open_via(candidate: Any) -> str:
+    """画像里的 open 字段 → 灯自己带的 openVia 串。
+
+    端口与 App 名都只来自本地画像，永远不来自请求体。
+    """
+    spec = candidate.open
+    if not isinstance(spec, dict):
+        return ""
+    if spec.get("tty"):
+        # `.app` 包里的进程没有可切过去的 Terminal 标签页，别假装能开。
+        return "" if candidate.in_bundle else "tty"
+    port = spec.get("url")
+    if isinstance(port, int) and 0 < port < 65_536:
+        return f"url:{port}" if port_listening(port) else ""
+    name = spec.get("app")
+    if isinstance(name, str) and name.strip():
+        return f"app:{name.strip()}"
+    return ""
+
+
+def discovery_claimed(table: dict[str, Any]) -> set[int]:
+    """原生源已经认领的 pid：Claude 登记表那棵树、ChatGPT.app 的 codex 树，
+    以及面板自己（部署路径与仓库路径不是一回事，只能认 pid）。"""
+    seeds = set(claude_claimed_pids(table))
+    seeds.add(os.getpid())
+    return discovery.claimed_pids(table, seeds)
+
+
+def discovered_agent(
+    candidate: Any, current_ms: int, table: dict[str, Any]
+) -> dict[str, Any] | None:
+    """一个候选 → 一盏灯；太年轻的进程返回 None（不出灯）。"""
+    current_s = current_ms // 1000
+    age_known = candidate.start_s is not None
+    if age_known and current_s - candidate.start_s < DISCOVERY_MIN_AGE_S:
+        return None
+    # 年龄不知道时按「够老」放行，并给 id 一个固定的替代值：id 必须每轮都一样，
+    # 否则同一个进程每次采样算出不同的 id，304 契约当场就断。
+    stamp = candidate.start_s if age_known else "u"
+    agent_id = f"{candidate.pid}-{stamp}"
+    key = completion_key(candidate.family, agent_id)
+
+    quiet_since = note_activity(
+        key,
+        tree_cpu(candidate.pid, table),
+        watch_mtime(candidate.home, candidate.watch),
+        current_ms,
+    )
+    state = _discovery_state.setdefault(
+        agent_id, {"samples": 0, "busySince": 0, "baseline": quiet_since}
+    )
+    state["samples"] = int(state["samples"]) + 1
+
+    # note_activity 第一次见到一个 key 时会把 quietSince 记成「刚刚」——那不是
+    # 活动，是初始化。不拿这一下当证据，否则每盏新灯都会先蓝 20 秒、再假装
+    # 完成一次转绿。只有 quietSince 真的往前走过，才算观察到活动。
+    moved_ever = quiet_since != int(state["baseline"])
+    raw = (
+        "busy"
+        if moved_ever and current_ms - quiet_since < DISCOVERY_ACTIVE_MS
+        else "idle"
+    )
+    if state["samples"] <= DISCOVERY_WARMUP_SAMPLES:
+        # 预热的头两轮只登记现状：第一轮 note_activity 必然把 quietSince 记成
+        # 「刚刚」，照着闩下去每盏灯一出生就会先闪一次假的绿。
+        status, completed_at = "idle", 0
+    else:
+        if raw == "busy" and not state["busySince"]:
+            state["busySince"] = current_ms
+        completed_at = latch_transition(
+            _discovery_transitions, agent_id, raw, current_ms, ("busy",), ("idle",)
+        )
+        if raw == "busy":
+            status = "thinking"
+        else:
+            status = "completed" if completed_at else "idle"
+
+    busy_since = int(state["busySince"] or 0)
+    busy_for = completed_at - busy_since if completed_at and busy_since else 0
+    open_via = discovered_open_via(candidate)
+    home_note = f" · {candidate.home_label}" if candidate.home_label else ""
+    cwd = process_cwd(candidate.pid)
+    agent = {
+        "id": agent_id,
+        "pid": candidate.pid,
+        "platform": candidate.family,
+        "name": f"{candidate.label} · {cwd_label(cwd)}",
+        "status": status,
+        "detail": f"自动发现{home_note}",
+        "cwd": cwd,
+        "cwdLabel": cwd_label(cwd),
+        "updatedAt": quiet_since,
+        "quietSince": quiet_since,
+        "completionId": completed_at if status == "completed" else 0,
+        "openable": bool(open_via),
+        # 这盏灯不是任何登记表给的，是从 ps 里认出来的。
+        "origin": "process",
+        "openVia": open_via,
+        # 发现型的灯拿不到 token 数据：画斜纹 `—`，绝不显示成 0%。
+        "load": empty_load(),
+        # 刚忙了一下下就完成的，不值得弹一条系统通知。
+        "notify": busy_for >= DISCOVERY_NOTIFY_MIN_BUSY_MS,
+        "satellites": [],
+    }
+    apply_completion_acknowledgement(candidate.family, agent)
+    # 绿灯期间 busySince 必须冻住，否则同一盏灯每轮算出不同的 notify，304 会抖。
+    if raw != "busy" and agent["status"] != "completed":
+        state["busySince"] = 0
+    return agent
+
+
+def load_discovered(
+    current_ms: int | None = None, table: dict[str, Any] | None = None
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """自动发现源：一次 ps 表扫描交出所有非原生运行时的灯。"""
+    current_ms = current_ms or now_ms()
+    table = table if table is not None else scan_processes()
+    if not DISCOVERY_ENABLED:
+        return [], {"state": "live", "detail": "自动发现已关闭"}
+    commands = table.get("commands") or {}
+    if not commands:
+        # 一台开着机的 Mac 不可能一个进程都没有：这是 ps 挂了，不是「没有任务」。
+        return [], {"state": "unavailable", "detail": "ps 没有返回任何进程"}
+
+    result = discovery.classify(
+        table,
+        discovery.DEFAULT_PROFILES,
+        discovery.DEFAULT_PROFILES.get("ignore") or {},
+        discovery_claimed(table),
+        Path.home(),
+        os.getuid(),
+        DISCOVERY_MAX_AGENTS,
+    )
+    _discovery_unclassified[:] = result.unclassified
+
+    agents: list[dict[str, Any]] = []
+    families: set[str] = set()
+    for candidate in result.candidates:
+        agent = discovered_agent(candidate, current_ms, table)
+        if agent is None:
+            continue
+        register_family_meta(candidate)
+        families.add(candidate.family)
+        agents.append(agent)
+
+    for pid in [pid for pid in _discovery_cwd if pid not in commands]:
+        _discovery_cwd.pop(pid, None)
+
+    detail = f"已识别 {len(families)} 个家族 / {len(agents)} 个进程"
+    if result.truncated:
+        detail = f"{detail} · 已截断 {result.truncated} 个"
+    return agents, {"state": "live", "detail": detail}
+
+
 def prune_tracking(live_keys: set[str]) -> None:
     """Sessions come and go; do not let the tracking dicts grow forever."""
     for key in [key for key in _activity if key not in live_keys]:
@@ -1348,6 +1668,10 @@ def prune_tracking(live_keys: set[str]) -> None:
         _claude_load_cache.pop(key, None)
     for key in [key for key in _subagent_cache if key not in live_sessions]:
         _subagent_cache.pop(key, None)
+    for key in [key for key in _discovery_transitions if key not in live_sessions]:
+        _discovery_transitions.pop(key, None)
+    for key in [key for key in _discovery_state if key not in live_sessions]:
+        _discovery_state.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -2481,6 +2805,10 @@ def history_pass(db_path: Path | None = None) -> None:
         history_init(connection)
         targets: list[dict[str, Any]] = []
         for spec in SOURCES:
+            # history_targets=None 是「这个源没有可回放的文件」（发现型平台
+            # 只有活体状态，没有 transcript / rollout），不是没实现。
+            if spec.history_targets is None:
+                continue
             targets.extend(spec.history_targets())
 
         def target_mtime(target: dict[str, Any]) -> float:
@@ -2793,14 +3121,18 @@ class SourceSpec:
     order: int
     kind: str
     load: Callable[[SampleContext], tuple[list[dict[str, Any]], dict[str, str]]]
-    open: Callable[[dict[str, Any]], None]
-    history_targets: Callable[[], list[dict[str, Any]]]
-    cost_mode: str
+    open: Callable[[dict[str, Any]], None] | None
+    history_targets: Callable[[], list[dict[str, Any]]] | None
+    cost_mode: str | None
     cost_label: str
     dismissible: bool
     lockable: bool
     hint: str
     empty_text: str
+    # 源自己就是一个平台（灯全挂在 spec.key 下），还是一个扇出源（灯各自带
+    # platform，源本身没有分区）。扇出源只在健康度出问题时才自己占一块分区，
+    # 否则「有 health 没 agents」会在界面上彻底消失。
+    is_platform: bool = True
 
 
 claude_spec = SourceSpec(
@@ -2835,8 +3167,27 @@ codex_spec = SourceSpec(
     empty_text="没有正在运行的 Codex 任务",
 )
 
+discovered_spec = SourceSpec(
+    key="discovered",
+    label="自动发现",
+    order=89,
+    kind="discovered",
+    load=lambda ctx: load_discovered(ctx["current_ms"], ctx["table"]),
+    open=None,
+    # 发现型平台不进历史库、不算钱：Task 6 靠这三个 None/— 把它们路由到
+    # 「只记起止、不算钱」的分支。
+    history_targets=None,
+    cost_mode=None,
+    cost_label="—",
+    dismissible=False,
+    lockable=False,
+    hint="从进程里认出来的运行时",
+    empty_text="没有发现别的 agent 进程",
+    is_platform=False,
+)
+
 # 按 order 排好序声明；载荷里的先后就是这里的先后。
-SOURCES: list[SourceSpec] = [claude_spec, codex_spec]
+SOURCES: list[SourceSpec] = [claude_spec, codex_spec, discovered_spec]
 
 # 载荷的根键。平台不再拼进根上，但 key 撞名依然会让前端把平台当元数据读，
 # 所以在注册表建好的当场就查一次。
@@ -2863,7 +3214,8 @@ check_source_keys(SOURCES)
 
 # 非原生平台（某个源顺手发现、自己没登记成 SourceSpec 的运行时）的展示元数据。
 # 键按载荷字段命名：label / order / kind / hint / dismissible / lockable /
-# emptyText，缺的字段走默认值。Phase 3 先留空，后续由运行时画像填。
+# emptyText，缺的字段走默认值。种子家族在下面一次性登记，动态发现的家族
+# 由 register_family_meta() 现登记。
 FAMILY_META: dict[str, dict[str, Any]] = {}
 
 DEFAULT_PLATFORM_META: dict[str, Any] = {
@@ -2875,6 +3227,45 @@ DEFAULT_PLATFORM_META: dict[str, Any] = {
     "lockable": False,
     "emptyText": "",
 }
+PLATFORM_META_FIELDS = frozenset(DEFAULT_PLATFORM_META)
+
+
+def seed_family_meta(profiles: dict[str, Any]) -> None:
+    """种子画像里的家族一次性登记进 FAMILY_META。
+
+    claude / codex 也会被写进来，但 platform_meta 先问 SOURCES，所以这两个
+    键永远轮不到家族表说话——留着它们只是为了让表和画像一一对应。
+    """
+    for key, profile in (profiles.get("families") or {}).items():
+        label = str(profile.get("label") or key.capitalize())
+        FAMILY_META[key] = {
+            "label": label,
+            "order": int(profile.get("order", 90)),
+            "kind": "discovered",
+            "hint": str(profile.get("hint") or "自动发现"),
+            "emptyText": f"没有正在运行的 {label}",
+        }
+
+
+seed_family_meta(discovery.DEFAULT_PROFILES)
+
+
+def register_family_meta(candidate: Any) -> None:
+    """把一个候选家族的展示元数据登记进 FAMILY_META（幂等）。
+
+    动态 dotdir 认出来的家族（`~/.fakeagent` → `fakeagent`）没写在任何表里，
+    label / order 只能由候选自己带过来，否则分区标题只能兜底成首字母大写。
+    """
+    key = candidate.family
+    entry = {
+        "label": candidate.label or key.capitalize(),
+        "order": int(candidate.order),
+        "kind": "discovered",
+        "hint": candidate.hint or "自动发现",
+        "emptyText": f"没有正在运行的 {candidate.label or key}",
+    }
+    if FAMILY_META.get(key) != entry:
+        FAMILY_META[key] = entry
 
 
 def source_for(platform: str) -> SourceSpec | None:
@@ -2896,9 +3287,13 @@ def platform_meta(key: str) -> dict[str, Any]:
         }
     meta = dict(DEFAULT_PLATFORM_META)
     meta["label"] = key.capitalize()
-    for field, value in (FAMILY_META.get(key) or {}).items():
-        if field in meta:
-            meta[field] = value
+    entry = FAMILY_META.get(key) or {}
+    # 内部表写错键名（empty_text vs emptyText）以前是无声丢弃：值没进载荷，
+    # 界面上只是少一行字，谁也发现不了。内部表就该写对，写错当场炸。
+    unknown = sorted(set(entry) - PLATFORM_META_FIELDS)
+    if unknown:
+        raise ValueError(f"FAMILY_META[{key}] 有未知字段：{'、'.join(unknown)}")
+    meta.update(entry)
     return meta
 
 
@@ -2917,6 +3312,10 @@ def aggregate_platforms(
     所以分区不是按来源切的。健康度：原生平台永远用它自己那个源的，非原生平台
     跟着最先产出它的来源走。原生平台哪怕一盏灯都没有也要出现，否则空态与
     「数据源不可用」没有地方渲染。
+
+    扇出源（自己不是一个平台的那种，比如自动发现）平时不占分区；但它一旦
+    读不到数据，就必须自己占一块出来写明原因——否则「ps 挂了」会表现成
+    「没有别的 agent 在跑」，正是绝不能把「没数据」显示成「没任务」那一条。
     """
     grouped: dict[str, list[dict[str, Any]]] = {}
     health: dict[str, dict[str, str]] = {}
@@ -2926,7 +3325,10 @@ def aggregate_platforms(
             grouped.setdefault(key, []).append(agent)
             health.setdefault(key, source_health)
     for source_key, _agents, source_health in loaded:
-        if source_for(source_key) is not None:
+        spec = source_for(source_key)
+        if spec is None:
+            continue
+        if spec.is_platform or str(source_health.get("state") or "live") != "live":
             grouped.setdefault(source_key, [])
             health[source_key] = source_health
 
@@ -3044,7 +3446,9 @@ def dispatch_notifications(payload: dict[str, Any]) -> list[str]:
     interesting = [
         (platform, agent)
         for platform, agent in agents
-        if agent.get("status") in NOTIFY_STATUSES
+        # notify=False 是灯自己说「这次别吵」（发现型的灯只忙了几秒就完成，
+        # 不值得弹系统通知）；没有这个键的灯照旧全部参与。
+        if agent.get("status") in NOTIFY_STATUSES and agent.get("notify", True)
     ]
 
     for key in [
@@ -3254,6 +3658,64 @@ def open_claude(agent: dict[str, Any]) -> None:
     open_terminal_tab(int(agent["pid"]))
 
 
+def open_url(port: int) -> None:
+    """只开本机回环上的一个数字端口——别的什么都不接受。"""
+    if not isinstance(port, int) or not 0 < port < 65_536:
+        raise RuntimeError("端口不合法")
+    result = subprocess.run(
+        ["open", f"http://127.0.0.1:{port}"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "无法打开浏览器")
+
+
+def open_app(name: str) -> None:
+    """`open -a <Name>`；名字只来自本地画像，不接受请求体里的字符串。"""
+    allowed = {
+        str((profile.get("open") or {}).get("app") or "")
+        for profile in (discovery.DEFAULT_PROFILES.get("families") or {}).values()
+    }
+    allowed.add("Claude")
+    if name not in allowed or not name:
+        raise RuntimeError(f"未登记的 App：{name}")
+    result = subprocess.run(
+        ["open", "-a", name],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or f"无法打开 {name}")
+
+
+def open_discovered(agent: dict[str, Any]) -> None:
+    """发现型的灯按自己带的 openVia 分派。
+
+    openVia 是服务端上一轮采样自己算出来的（端口来自画像 + 监听探测，App 名
+    来自画像），请求体只提供 platform 与 id，永远不参与决定开什么。
+    """
+    via = str(agent.get("openVia") or "")
+    if via == "tty":
+        open_terminal_tab(int(agent["pid"]))
+        return
+    if via.startswith("url:"):
+        try:
+            port = int(via[4:])
+        except ValueError:
+            raise RuntimeError("端口不合法")
+        open_url(port)
+        return
+    if via.startswith("app:"):
+        open_app(via[4:])
+        return
+    raise RuntimeError("这盏灯没有可打开的入口")
+
+
 def open_codex(agent: dict[str, Any]) -> None:
     result = subprocess.run(
         ["open", f"codex://threads/{agent['id']}"],
@@ -3431,12 +3893,18 @@ class Handler(BaseHTTPRequestHandler):
         if not agent:
             self.send_json({"error": "会话已经离线"}, 404)
             return
-        # 只有原生源登记了 open 回调；自动发现的平台没有窗口可切，直接走确认分支。
+        # 原生源用自己登记的 open 回调；自动发现的平台按灯上的 openVia 分派。
+        # 两样都没有的灯（没有可切窗口的入口）直接落到下面的确认分支。
         spec = source_for(platform)
+        opener: Callable[[dict[str, Any]], None] | None = None
+        if spec is not None and spec.open is not None:
+            opener = spec.open
+        elif str(agent.get("openVia") or ""):
+            opener = open_discovered
         opened = False
-        if spec is not None and agent.get("openable"):
+        if opener is not None and agent.get("openable"):
             try:
-                spec.open(agent)
+                opener(agent)
             except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                 self.send_json({"error": str(error)}, 500)
                 return
