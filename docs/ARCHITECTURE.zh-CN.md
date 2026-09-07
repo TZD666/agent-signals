@@ -85,7 +85,7 @@
 ./deploy.sh
 ```
 
-四步固定顺序：跑测试（用 launchd 里那个 `/usr/bin/python3`）→ 拷 `server.py` 与 `static/*` 到运行目录（`discovery.py`、`cloud.py` 存在才拷；`discovery.py` 自 2.3.0 起是必需的，`server.py` 启动时按路径加载它，缺了就起不来）→ `launchctl kickstart -k` 重启服务 → 轮询 `/health` 直到 `version` 与 `server.py` 里的 `APP_VERSION` 对上、**并且** `pid` 与重启前不同（20 秒超时，超时会打印 `agent-signals.err.log` 末尾并非零退出）。测试不过就一个文件都不拷。
+四步固定顺序：跑测试（用 launchd 里那个 `/usr/bin/python3`）→ 拷 `server.py`、`discovery.py` 与 `static/*` 到运行目录（`discovery.py` 自 2.3.0 起无条件拷贝：`server.py` 启动时按路径加载它，缺了就起不来，所以宁可在 `cp` 这一步失败；`cloud.py` 仍是存在才拷，它到 Phase 7 才出现）→ `launchctl kickstart -k` 重启服务 → 轮询 `/health` 直到 `version` 与 `server.py` 里的 `APP_VERSION` 对上、**并且** `pid` 与重启前不同（20 秒超时，超时会打印 `agent-signals.err.log` 末尾并非零退出）。测试不过就一个文件都不拷。
 
 比 pid 是必要的：`APP_VERSION` 在同一阶段内是不变的手写常量，只比版本号的话，端口被别的野进程占着、新进程根本没起来时，老进程会用同一个版本号把健康检查骗过去。
 
@@ -97,7 +97,7 @@
 
 ```
 {
-  "schemaVersion": 2, "generatedAt": …, "version": "2.3.0",
+  "schemaVersion": 2, "generatedAt": …, "version": "2.3.1",
   "sources":       { "<源 key>": {state, detail} },      // 采集端健康度，按来源
   "notifications": {state, detail},
   "platforms": [
