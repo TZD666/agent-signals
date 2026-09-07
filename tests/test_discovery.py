@@ -136,7 +136,10 @@ WORKBUDDY_HELPER = (
     "WorkBuddy Helper (GPU) --type=gpu-process "
     "--user-data-dir=/Users/edy/.workbuddy"
 )
-# 以下五条是 2026-09-07 用户真开着 WorkBuddy 时抓的原样 ps 行。
+# 以下几条取自 2026-09-07 用户真开着 WorkBuddy 时抓的 ps。除
+# WORKBUDDY_CODEBUDDY 的 session id 做了脱敏（真实值是
+# 251af04a-0d3f-4c71-98ef-24f55b7e34e7，这里只保留前 8 位、后面补占位）之外，
+# 其余都是原样，长参数按行宽做了截断但没有改写。
 WORKBUDDY_MAIN_REAL = "/Applications/WorkBuddy.app/Contents/MacOS/Electron"
 WORKBUDDY_CRASHPAD = (
     "/Applications/WorkBuddy.app/Contents/Frameworks/Electron Framework.framework/"
@@ -743,7 +746,10 @@ class DotdirTests(unittest.TestCase):
             (15918, 1, UID, WORKBUDDY_SNAPSHOT_ZSH),
         ]
         # 没有 WorkBuddy 那盏灯时：整条丢掉，一盏都不出。
-        self.assertEqual(run(bystanders).candidates, [])
+        dropped = run(bystanders)
+        self.assertEqual(dropped.candidates, [])
+        # 但不能完全静默——丢弃数要报上去，否则「我的进程怎么不出现」没法查。
+        self.assertEqual(dropped.dropped, 3)
         # WorkBuddy 在跑时：并进那盏灯当成员，仍然只有一盏灯。
         result = run([(15116, 1, UID, WORKBUDDY_MAIN_REAL, 500)] + bystanders)
         self.assertEqual(families(result), ["workbuddy"])
@@ -861,20 +867,46 @@ class RollUpTests(unittest.TestCase):
         # 中间隔着一个异族候选，不再往上认亲：三盏灯。
         self.assertEqual(sorted(c.pid for c in result.candidates), [100, 200, 300])
 
-    def test_same_app_bundle_merges_without_a_parent_chain(self):
+    def test_an_orphaned_helper_merges_back_into_its_app(self):
         # macOS 把 helper 重挂到 launchd 之后父子链是断的，roll-up 够不着。
-        # 同 family + 同 .app 包必须仍然收成一盏。
+        # 孤儿（自己没有子进程）要并回同 family + 同 .app 包的那个实例。
         rows = [
             (15116, 1, UID, WORKBUDDY_MAIN_REAL, 500),
             (16344, 15116, UID, WORKBUDDY_SANDBOX, 800),
-            # 故意让它 ppid=1，且比主进程还老，验证根取最老的那个。
-            (15100, 1, UID, WORKBUDDY_CODEBUDDY, 400),
+            (15100, 1, UID, WORKBUDDY_CODEBUDDY, 400),  # 掉队的孤儿，ppid=1
         ]
         result = run(rows)
         self.assertEqual(len(result.candidates), 1)
         candidate = result.candidates[0]
-        self.assertEqual(candidate.pid, 15100)
+        # 接收方是**有子进程**的那个真实例，不是碰巧最老的孤儿。
+        self.assertEqual(candidate.pid, 15116)
         self.assertEqual(candidate.members, (15100, 15116, 16344))
+
+    def test_two_independent_instances_are_never_merged(self):
+        # 两个真正独立的实例（重启时新旧短暂并存、或者应用允许多开）各自
+        # 都带着子进程。无条件按「同 family + 同 .app 包」合并会把其中一个
+        # 会话直接吞掉，用户再也看不见它。
+        rows = [
+            (15116, 1, UID, WORKBUDDY_MAIN_REAL, 500),
+            (16344, 15116, UID, WORKBUDDY_SANDBOX, 800),
+            (20000, 1, UID, WORKBUDDY_MAIN_REAL, 900),
+            (20001, 20000, UID, WORKBUDDY_SANDBOX, 950),
+        ]
+        result = run(rows)
+        self.assertEqual(sorted(c.pid for c in result.candidates), [15116, 20000])
+        by_pid = {c.pid: c for c in result.candidates}
+        self.assertEqual(by_pid[15116].members, (15116, 16344))
+        self.assertEqual(by_pid[20000].members, (20000, 20001))
+
+    def test_two_orphans_with_no_host_each_keep_their_light(self):
+        # 全是叶子时谁也没资格当接收方：宁可多一盏灯，也不要凭空吞掉一个。
+        rows = [
+            (15116, 1, UID, WORKBUDDY_MAIN_REAL, 500),
+            (20000, 1, UID, WORKBUDDY_MAIN_REAL, 900),
+        ]
+        self.assertEqual(
+            sorted(c.pid for c in run(rows).candidates), [15116, 20000]
+        )
 
     def test_app_bundle_merge_does_not_cross_families_or_apps(self):
         rows = [
@@ -959,7 +991,29 @@ class WatchGlobTests(unittest.TestCase):
         # 每几秒就写），sessions/*.json 变了 4 次（整 30 秒一次的心跳），
         # traces/*/trace_*.json 一次没变。前两个说的是「应用开着」。
         watch = discovery.DEFAULT_PROFILES["families"]["workbuddy"]["watch"]
-        self.assertEqual(watch, ["traces/*/trace_*.json"])
+        self.assertNotIn("logs/*.log", watch)
+        self.assertNotIn("sessions/*.json", watch)
+        self.assertIn("traces/*/trace_*.json", watch)
+
+    def test_workbuddy_also_watches_the_file_modification_trail(self):
+        # 09-04 会话磁盘取证：134 秒的真实工作里 trace 只写了 1 次，
+        # 灯会提前 114 秒转绿。贯穿整个任务的是 workspace 里的修改备份。
+        watch = discovery.DEFAULT_PROFILES["families"]["workbuddy"]["watch"]
+        self.assertIn("workspace/sessions/*/modify_backup/*", watch)
+        self.assertIn("workspace/sessions/*/.modify_backup_meta/*", watch)
+
+    def test_a_family_with_a_sparse_signal_gets_a_patient_window(self):
+        # 补上 workspace 之后任务期间的写入间隔最大仍有 93 秒，20 秒的全局
+        # 窗口跨不过去。拿 09-04 的真实时间戳重放：120 秒能让灯全程保持蓝。
+        profile = discovery.DEFAULT_PROFILES["families"]["workbuddy"]
+        self.assertEqual(profile["activeMs"], 120_000)
+        item = [c for c in run([(15116, 1, UID, WORKBUDDY_MAIN_REAL)]).candidates]
+        self.assertEqual(item[0].active_ms, 120_000)
+        # 没写 activeMs 的家族用全局默认。
+        self.assertNotIn("activeMs", discovery.DEFAULT_PROFILES["families"]["dsh"])
+        self.assertEqual(
+            run([(5001, 1, UID, DSH_NODE)]).candidates[0].active_ms, 0
+        )
 
     def test_default_watch_has_no_log_glob(self):
         # 同一个陷阱对任何自动学出来的家族都成立。
@@ -1234,6 +1288,70 @@ class DiscoveredLightTests(unittest.TestCase):
             agent = self.sample(1_700_000_000_000, item=item)
         self.assertEqual(agent["name"], "WorkBuddy · 2026-09-07-16-25-42")
 
+    def test_a_patient_window_bridges_a_sparse_signal(self):
+        # 09-04 那次会话的真实间隔：写入 → 静默 93 秒 → 再写入。20 秒的窗口
+        # 会在静默期中间转绿（没干完就说干完了）；120 秒能撑过去。
+        base = 1_700_000_000_000
+        def replay(item):
+            server._discovery_state.clear()
+            server._discovery_transitions.clear()
+            server._activity.clear()
+            seen = []
+            for step in range(24):  # 第 2 轮写一次盘，之后一路静默
+                now = base + step * 5_000
+                mtime = 200.0 if step >= 2 else 100.0
+                with patch.object(server, "watch_mtime", return_value=mtime):
+                    seen.append(self.sample(now, item=item)["status"])
+            return seen
+        impatient = replay(candidate(family="workbuddy", label="WorkBuddy"))
+        patient = replay(
+            candidate(family="workbuddy", label="WorkBuddy", active_ms=120_000)
+        )
+        # 静默 93 秒（第 19 轮）时：20 秒窗口早就转绿了，120 秒窗口还在蓝。
+        self.assertIn("completed", impatient[:19])
+        self.assertNotIn("completed", patient[:19])
+
+    def test_a_bystander_install_dir_never_names_the_light(self):
+        # absorb_seeded_dotdirs 把插件的 MCP server 并成了成员，它们的安装目录
+        # 同样能过 useful_cwd 的其它筛选。上次没炸只是因为真会话的 pid 恰好排
+        # 在旁观者前面——那是运气不是设计。
+        item = candidate(
+            family="workbuddy",
+            label="WorkBuddy",
+            pid=15116,
+            home=str(Path.home() / ".workbuddy"),
+            home_label="~/.workbuddy",
+            members=(15116, 15900, 15901),
+        )
+        cwds = {
+            15116: "/",
+            15900: str(
+                Path.home()
+                / ".workbuddy/plugins/cache/workbuddy-builtin/weixinpay/1.6.109"
+            ),
+            15901: str(Path.home() / ".workbuddy/plugins/cache/sheetagent/1.2.0"),
+        }
+        with patch.object(server, "process_cwd", side_effect=cwds.get):
+            agent = self.sample(1_700_000_000_000, item=item)
+        self.assertEqual(agent["name"], "WorkBuddy")
+
+    def test_a_real_session_cwd_still_wins_over_bystanders(self):
+        item = candidate(
+            family="workbuddy",
+            label="WorkBuddy",
+            pid=15116,
+            home=str(Path.home() / ".workbuddy"),
+            members=(15116, 15890, 15900),
+        )
+        cwds = {
+            15116: "/",
+            15890: "/Users/edy/WorkBuddy/2026-09-07-16-25-42",
+            15900: str(Path.home() / ".workbuddy/plugins/cache/x/1.6.109"),
+        }
+        with patch.object(server, "process_cwd", side_effect=cwds.get):
+            agent = self.sample(1_700_000_000_000, item=item)
+        self.assertEqual(agent["name"], "WorkBuddy · 2026-09-07-16-25-42")
+
     def test_bundle_and_temp_cwds_are_not_useful(self):
         self.assertFalse(server.useful_cwd("/"))
         self.assertFalse(server.useful_cwd(""))
@@ -1248,6 +1366,11 @@ class DiscoveredLightTests(unittest.TestCase):
         # 家目录仍然算数：dsh 那盏「DeepSeek Harness · ~」不该被这条动到。
         self.assertTrue(server.useful_cwd(str(Path.home())))
         self.assertTrue(server.useful_cwd("/Users/edy/WorkBuddy/2026-09-07-16-25-42"))
+        # agent 自己的状态/安装目录永远不是用户的项目目录。
+        home = str(Path.home() / ".workbuddy")
+        self.assertFalse(server.useful_cwd(home, home))
+        self.assertFalse(server.useful_cwd(f"{home}/plugins/cache/x/1.6.109", home))
+        self.assertTrue(server.useful_cwd("/Users/edy/WorkBuddy/2026-09-07", home))
 
     def test_completed_notification_gated_by_min_busy(self):
         base = 1_700_000_000_000

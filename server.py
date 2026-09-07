@@ -1499,30 +1499,41 @@ def process_cwd(pid: int) -> str:
     return cwd
 
 
-def useful_cwd(cwd: str) -> bool:
+def useful_cwd(cwd: str, home: str = "") -> bool:
     """这个 cwd 拿来给灯起名字有没有意义。
 
     真机上 WorkBuddy 主进程的 cwd 就是 `/`，拼出来的灯叫「WorkBuddy · /」；
     它的成员进程要么也在 `/`，要么在 `.app` 包里、要么在 `/private/var/folders`
     的临时目录里——都不是用户认得的东西。认不出就别硬拼。
+
+    `home` 是这个家族自己的状态目录。被 `absorb_seeded_dotdirs` 并进来的旁观者
+    （插件的 MCP server）cwd 是自己的安装目录
+    `~/.workbuddy/plugins/cache/…/1.6.109`，它能过前面几条筛选，却会让卡片叫
+    「WorkBuddy · 1.6.109」——版本号冒充项目名，比 `· /` 更糟。**agent 自己的
+    状态/安装目录永远不是用户的项目目录。**
     """
     if not cwd or cwd == "/":
         return False
     if discovery.BUNDLE_MARKER in cwd:
         return False
-    return not cwd.startswith(("/private/var/folders/", "/var/folders/", "/tmp/"))
+    if cwd.startswith(("/private/var/folders/", "/var/folders/", "/tmp/")):
+        return False
+    if home and (cwd == home or cwd.startswith(home.rstrip("/") + "/")):
+        return False
+    return True
 
 
 def candidate_cwd(candidate: Any) -> str:
     """给灯起名字用的 cwd：根进程说不清就问成员，都说不清就返回空串。"""
+    home = str(getattr(candidate, "home", "") or "")
     cwd = process_cwd(candidate.pid)
-    if useful_cwd(cwd):
+    if useful_cwd(cwd, home):
         return cwd
     for pid in candidate.members:
         if pid == candidate.pid:
             continue
         member = process_cwd(pid)
-        if useful_cwd(member):
+        if useful_cwd(member, home):
             return member
     return ""
 
@@ -1592,9 +1603,12 @@ def discovered_agent(
     # 活动，是初始化。不拿这一下当证据，否则每盏新灯都会先蓝 20 秒、再假装
     # 完成一次转绿。只有 quietSince 真的往前走过，才算观察到活动。
     moved_ever = quiet_since != int(state["baseline"])
+    # 画像可以给自己一个更有耐心的窗口：文件信号稀疏的家族（WorkBuddy 实测
+    # 任务中间会有 93 秒不写盘），20 秒跨不过静默期，会在任务没完时就转绿。
+    active_ms = int(getattr(candidate, "active_ms", 0)) or DISCOVERY_ACTIVE_MS
     raw = (
         "busy"
-        if moved_ever and current_ms - quiet_since < DISCOVERY_ACTIVE_MS
+        if moved_ever and current_ms - quiet_since < active_ms
         else "idle"
     )
     if state["samples"] <= DISCOVERY_WARMUP_SAMPLES:
@@ -1753,6 +1767,10 @@ def load_discovered(
     detail = f"已识别 {len(families)} 个家族 / {len(agents)} 个进程"
     if attached:
         detail = f"{detail} · {attached} 个挂成卫星"
+    if result.dropped:
+        # 只提到了某个种子家族的目录名、而那盏灯又不在的候选被整条丢掉了。
+        # 报出来，否则「我的 agent 进程怎么一直不出现」没法排查。
+        detail = f"{detail} · {result.dropped} 个旁观者已丢弃"
     if result.truncated:
         detail = f"{detail} · 已截断 {result.truncated} 个"
     return agents, {"state": "live", "detail": detail}

@@ -175,8 +175,9 @@ def _family(
     home: str = "",
     watch: Iterable[str] = (),
     open_with: dict[str, Any] | None = None,
+    active_ms: int = 0,
 ) -> dict[str, Any]:
-    return {
+    profile = {
         "label": label,
         "order": order,
         "source": "seed",
@@ -187,6 +188,11 @@ def _family(
         "open": open_with,
         "hint": "自动发现",
     }
+    if active_ms:
+        # 这个家族的活动信号有多稀疏：文件写得稀的家族要更有耐心，
+        # 否则任务中间的静默期会被当成「干完了」。0 表示用全局默认。
+        profile["activeMs"] = active_ms
+    return profile
 
 
 DEFAULT_PROFILES: dict[str, Any] = {
@@ -338,13 +344,24 @@ DEFAULT_PROFILES: dict[str, Any] = {
             25,
             paths=["/Applications/WorkBuddy.app/"],
             home="~/.workbuddy",
-            # 只留 traces。本机空转 120 秒实测：`logs/*.log` 每几秒就写一次
-            # （renderer.log / daemon.log，Electron 一直在写），`sessions/*.json`
-            # 每 30 秒整点重写一次（lastHeartbeat 心跳）。这两个说的是「应用
-            # 开着」，不是「agent 在干活」；把它们当活动信号，quietSince 每轮
-            # 都被刷新，灯永远蓝、绿灯在物理上不可能出现。同一段时间里
-            # `traces/*/trace_*.json` 一次没动过（上次写入是 7 分钟前那次真任务）。
-            watch=["traces/*/trace_*.json"],
+            # 不要 `logs/*.log`（每几秒就写）和 `sessions/*.json`（整 30 秒的
+            # lastHeartbeat 心跳）——那是「应用开着」，不是「在干活」。
+            #
+            # 但只留 traces 也不够：09-04 那次会话磁盘取证显示，134 秒的真实
+            # 工作里 trace 只写了 1 次（17:11:10），灯会在 17:11:08 就转绿，
+            # 提前 114 秒。真正贯穿整个任务的是 workspace 里的文件修改备份。
+            # 补上之后，任务期间的写入变成 5 次，最大间隔 93 秒。
+            watch=[
+                "traces/*/trace_*.json",
+                "workspace/sessions/*/modify_backup/*",
+                "workspace/sessions/*/.modify_backup_meta/*",
+            ],
+            # 即便如此，这个家族的文件信号仍然是稀疏的（最大 93 秒不写盘，
+            # 那段时间 agent 在等模型）。20 秒的全局窗口跨不过去，还是会提前
+            # 89 秒转绿。给它一个更有耐心的窗口：拿 09-04 的真实时间戳重放，
+            # 120 秒能让灯全程保持蓝，任务结束后 121 秒才转绿——晚一点说
+            # 「干完了」，比没干完就说干完了便宜得多。
+            active_ms=120_000,
             open_with={"app": "WorkBuddy"},
         ),
     },
@@ -449,6 +466,8 @@ class Candidate:
     exe: str
     command: str
     start_s: int | None
+    # 这个家族「静默多久算做完」；0 表示用全局默认。文件信号稀疏的家族要更耐心。
+    active_ms: int = 0
     # exe 或脚本任一住在 GUI 应用包里：这种进程没有可切过去的终端标签页。
     bundle_anywhere: bool = False
     # teammate 进程自报的身份：agent 名字 + 父会话 id（都可能是空串）。
@@ -475,6 +494,9 @@ class ClassifyResult(NamedTuple):
     candidates: list[Candidate]
     unclassified: list[Unclassified]
     truncated: int
+    # 被 absorb_seeded_dotdirs 整条丢掉的候选数。丢弃是对的（只是提到了目录名
+    # 的旁观者不该冒充这个家族），但不能完全静默——健康度里要报出来。
+    dropped: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -997,27 +1019,44 @@ def merge_same_bundle(
     matched: dict[int, tuple],
     commands: dict[Any, str],
     starts: dict[Any, Any],
+    children: dict[Any, Any],
 ) -> dict[int, list[int]]:
-    """同一个 GUI 应用包里的同家族进程收成一盏灯，不靠父子链。
+    """把「被重挂到 launchd 的孤儿 helper」并回同一个 App 包里的那盏灯。
 
     macOS 会把 helper 重挂到 launchd（真机上 WorkBuddy 的 crashpad 就是
-    `ppid = 1`），父子链在这种时候是断的，roll-up 够不着。按「同 family +
-    同 `.app` 包」再并一次，根取最老的那个。
+    `ppid = 1`），父子链在这种时候是断的，roll-up 够不着。
+
+    但**只并叶子**：被并走的那个根自己不能有子进程，接收方必须有。理由是
+    这条规则要修的是「掉队的 helper」，而两个真正独立的实例（重启时新旧短暂
+    并存、或者应用允许多开）各自都带着一大串子进程——无条件按「同 family +
+    同 `.app` 包」合并会把其中一个会话直接吞掉，用户就再也看不见它了。
+    叶子/非叶子是这两种情形唯一可靠的结构差别。
     """
+    def is_leaf(pid: int) -> bool:
+        return not (children.get(pid) or ())
+
     groups: dict[tuple, list[int]] = {}
-    loose: dict[int, list[int]] = {}
+    merged: dict[int, list[int]] = {}
     for root, pids in members.items():
         bundle = app_bundle_root(parse_argv(commands[root]).region)
         if not bundle:
-            loose[root] = pids
+            merged[root] = pids
             continue
         groups.setdefault((matched[root][0], bundle), []).append(root)
 
-    merged = dict(loose)
     for roots in groups.values():
-        keeper = _oldest(roots, starts)
-        combined: list[int] = []
-        for root in roots:
+        hosts = [root for root in roots if not is_leaf(root)]
+        orphans = [root for root in roots if is_leaf(root)]
+        if not hosts:
+            # 全是叶子：谁也没资格当接收方，各归各的。
+            for root in roots:
+                merged[root] = members[root]
+            continue
+        keeper = _oldest(hosts, starts)
+        for root in hosts:
+            merged[root] = list(members[root])
+        combined = list(merged[keeper])
+        for root in orphans:
             combined.extend(members[root])
         merged[keeper] = sorted(set(combined))
     return merged
@@ -1028,7 +1067,7 @@ def absorb_seeded_dotdirs(
     matched: dict[int, tuple],
     seeded: Iterable[str],
     starts: dict[Any, Any],
-) -> dict[int, list[int]]:
+) -> tuple[dict[int, list[int]], int]:
     """dotdir 规则推出来的候选，绝不给「已经有种子画像的家族」另立门户。
 
     真机上 WorkBuddy 开着的时候，两个插件的 MCP server 和一个采集 shell
@@ -1047,6 +1086,7 @@ def absorb_seeded_dotdirs(
 
     merged: dict[int, list[int]] = {}
     absorbed: dict[int, list[int]] = {}
+    dropped = 0
     for root, pids in members.items():
         family, _label, source, _home = matched[root]
         if source != "dotdir" or family not in seeded_keys:
@@ -1055,10 +1095,13 @@ def absorb_seeded_dotdirs(
         candidates = hosts.get(family)
         if candidates:
             absorbed.setdefault(_oldest(candidates, starts), []).extend(pids)
-        # 没有那盏灯就整条丢掉，不进 merged。
+        else:
+            # 没有那盏灯就整条丢掉。丢弃数要报上去——完全静默的话，将来
+            # 「我的 agent 进程怎么一直不出现」会极难排查。
+            dropped += 1
     for host, pids in absorbed.items():
         merged[host] = sorted(set(merged.get(host, []) + pids))
-    return merged
+    return merged, dropped
 
 
 def expand_watch(pattern: str, max_depth: int = WATCH_MAX_DEPTH) -> tuple[str, ...]:
@@ -1145,8 +1188,8 @@ def classify(
     )
     # 父子链之外还有两条并线：同一个 App 包里的同族进程收成一盏；dotdir 推出
     # 来的旁观者并进已有种子家族的那盏灯，没有就丢掉。
-    members = merge_same_bundle(members, matched, commands, starts)
-    members = absorb_seeded_dotdirs(members, matched, families, starts)
+    members = merge_same_bundle(members, matched, commands, starts, children)
+    members, dropped = absorb_seeded_dotdirs(members, matched, families, starts)
     candidates: list[Candidate] = []
     for root, pids in members.items():
         family, label, source, found_home = matched[root]
@@ -1173,6 +1216,7 @@ def classify(
                 exe=argv.exe,
                 command=commands[root],
                 start_s=_start_of(starts, root),
+                active_ms=int(profile.get("activeMs") or 0),
                 bundle_anywhere=argv.bundle_anywhere,
                 agent_name=agent_name,
                 parent_session=parent_session,
@@ -1188,7 +1232,9 @@ def classify(
     candidates.sort(key=lambda item: (item.order, item.family, item.pid))
 
     unclassified.sort(key=lambda item: (-(_start_of(starts, item.pid) or 0), item.pid))
-    return ClassifyResult(candidates, unclassified[:UNCLASSIFIED_LIMIT], truncated)
+    return ClassifyResult(
+        candidates, unclassified[:UNCLASSIFIED_LIMIT], truncated, dropped
+    )
 
 
 def _start_of(starts: dict[Any, Any], pid: int) -> int | None:
