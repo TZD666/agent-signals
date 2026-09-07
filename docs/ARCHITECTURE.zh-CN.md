@@ -39,9 +39,10 @@
 
 ## 卫星
 
-主灯外围的小卫星点有两种来路：
+主灯外围的小卫星点有三种来路：
 
 - **登记表卫星**：`claude --bg` 后台会话，以及被某个会话拉起来的 `claude -p`。挂靠改成沿 PPID 链上溯（≤8 层）找真正的父会话，找不到才退回原来的"同目录 / 最近活跃"猜测——之前同目录的另一盏灯会把它抢走。
+- **teammate 卫星**：team 里排出去的 agent。它们在 `~/.claude/sessions/` 里只写 `.key` 不写 `.json`，登记表认领不到，所以由自动发现认出来；命令行里带 `--parent-session-id`，指向登记表里某个还活着的会话时就挂成那盏灯的卫星，名字取 `--agent-name`（`gh-search` / `exec-runway`，正是用户在自己的 team 界面里看到的那个）。状态走自动发现那套活动信号，不读 transcript。**父会话不在登记表里（孤儿）时仍然单独出灯**——找不到父灯不是让一个真在跑的进程凭空消失的理由。
 - **子代理卫星**：Task 子代理（`<transcript 目录>/<sessionId>/subagents/agent-*.jsonl`）。它没有结束标记，只能看 jsonl 的 mtime：`AGENT_SIGNALS_SUBAGENT_ACTIVE_MS`（60 秒）内有写入算思考中，之后转已完成，静默超过 `AGENT_SIGNALS_SUBAGENT_LINGER_MS`（10 分钟）不再显示。只 stat 文件加读同名的小 `.meta.json`，一个字对话内容都不读；这类卫星只作展示，不参与完成确认。
 
 ## 疑似卡死怎么判定

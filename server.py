@@ -1589,11 +1589,14 @@ def discovered_agent(
         detail = "桌面 App"
         open_via = "app:Claude"
     cwd = process_cwd(candidate.pid)
+    # teammate 进程自报的名字（`gh-search` / `exec-runway`）就是用户在自己的
+    # team 界面里看到的那个，比 cwd 拼出来的「Claude · memory」有用得多。
+    name = candidate.agent_name or f"{candidate.label} · {cwd_label(cwd)}"
     agent = {
         "id": agent_id,
         "pid": candidate.pid,
         "platform": candidate.family,
-        "name": f"{candidate.label} · {cwd_label(cwd)}",
+        "name": name,
         "status": status,
         "detail": detail,
         "cwd": cwd,
@@ -1618,8 +1621,42 @@ def discovered_agent(
     return agent
 
 
+def satellite_hosts(context: SampleContext | None) -> dict[str, dict[str, Any]]:
+    """本轮已经出好的原生 Claude 灯，按 sessionId 建表。
+
+    teammate 进程要挂到父会话那盏灯上，而父灯是上一个数据源刚交出来的。
+    找不到（没有 context、claude 源还没跑、父会话已经离线）就返回空表——
+    调用方据此让它自己单独出灯，绝不会因为找不到父灯就把一个真在跑的进程
+    悄悄吞掉。
+    """
+    for source_key, agents, _health in (context or {}).get("loaded") or ():
+        if source_key != "claude":
+            continue
+        return {str(agent.get("id") or ""): agent for agent in agents}
+    return {}
+
+
+def attach_teammate(
+    agent: dict[str, Any], candidate: Any, hosts: dict[str, dict[str, Any]]
+) -> bool:
+    """能挂就挂成父灯的卫星；挂上了返回 True。"""
+    host = hosts.get(candidate.parent_session)
+    if host is None:
+        return False
+    satellites = host.setdefault("satellites", [])
+    # 同一个进程不许出现两次。今天两类卫星的 id 空间天然不重叠
+    # （Task 子代理是 `agent-<hex>` 文件名，teammate 是 `pid-启动时刻`），
+    # 这道去重是把「一个 id 一颗卫星」钉成不变量，而不是热路径。
+    if any(str(item.get("id")) == agent["id"] for item in satellites):
+        return True
+    satellites.append(satellite_of(agent, "teammate"))
+    return True
+
+
 def load_discovered(
-    current_ms: int | None = None, table: dict[str, Any] | None = None
+    current_ms: int | None = None,
+    table: dict[str, Any] | None = None,
+    context: SampleContext | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """自动发现源：一次 ps 表扫描交出所有非原生运行时的灯。"""
     current_ms = current_ms or now_ms()
@@ -1643,20 +1680,30 @@ def load_discovered(
     )
     _discovery_unclassified[:] = result.unclassified
 
+    hosts = satellite_hosts(context)
     agents: list[dict[str, Any]] = []
     families: set[str] = set()
+    attached = 0
     for candidate in result.candidates:
         agent = discovered_agent(candidate, current_ms, table)
         if agent is None:
             continue
         register_family_meta(candidate)
         families.add(candidate.family)
+        # team 里排出去的 agent 是父会话的一部分：挂成环绕的卫星，别自己占
+        # 一张卡。父会话不在登记表里（孤儿）时照旧单独出灯——找不到爹不是
+        # 让一个真在跑的进程凭空消失的理由。
+        if candidate.parent_session and attach_teammate(agent, candidate, hosts):
+            attached += 1
+            continue
         agents.append(agent)
 
     for pid in [pid for pid in _discovery_cwd if pid not in commands]:
         _discovery_cwd.pop(pid, None)
 
     detail = f"已识别 {len(families)} 个家族 / {len(agents)} 个进程"
+    if attached:
+        detail = f"{detail} · {attached} 个挂成卫星"
     if result.truncated:
         detail = f"{detail} · 已截断 {result.truncated} 个"
     return agents, {"state": "live", "detail": detail}
@@ -3181,7 +3228,8 @@ discovered_spec = SourceSpec(
     label="自动发现",
     order=89,
     kind="discovered",
-    load=lambda ctx: load_discovered(ctx["current_ms"], ctx["table"]),
+    # 带上整个 ctx：teammate 进程要挂到前面那个源刚交出来的 Claude 灯上。
+    load=lambda ctx: load_discovered(ctx["current_ms"], ctx["table"], ctx),
     open=None,
     # 发现型平台不进历史库、不算钱：Task 6 靠这三个 None/— 把它们路由到
     # 「只记起止、不算钱」的分支。
@@ -3370,6 +3418,8 @@ def snapshot(locked_codex_ids: set[str] | None = None) -> dict[str, Any]:
         "locked_ids": locked_codex_ids or set(),
     }
     loaded: list[tuple[str, list[dict[str, Any]], dict[str, str]]] = []
+    # 后跑的源看得见前面的源交出了什么（自动发现要往 Claude 灯上挂卫星）。
+    context["loaded"] = loaded
     sources: dict[str, dict[str, str]] = {}
     for spec in SOURCES:
         agents, health = spec.load(context)
@@ -3377,11 +3427,14 @@ def snapshot(locked_codex_ids: set[str] | None = None) -> dict[str, Any]:
         sources[spec.key] = health
     platforms = aggregate_platforms(loaded)
 
+    # 卫星也要算「还活着」：它们的活动信号与闩锁跟主灯用同一批字典，漏掉的话
+    # 每轮都会被当成陌生 key 清掉，状态机永远回到预热态、再也蓝不起来。
     prune_tracking(
         {
-            completion_key(entry["key"], agent["id"])
+            completion_key(entry["key"], item["id"])
             for entry in platforms
             for agent in entry["agents"]
+            for item in [agent, *(agent.get("satellites") or ())]
         }
     )
     counts: dict[str, Any] = {

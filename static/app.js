@@ -263,7 +263,9 @@ function satelliteMarkup(satellites) {
     satellites.length > 8
       ? `<span class="satellite-overflow">+${satellites.length - 8}</span>`
       : "";
-  return `<span class="satellites" aria-label="${satellites.length} 个子代理">${dots}${overflow}</span>`;
+  // 卫星现在有三种来路（登记表后台会话 / Task 子代理 / team 里排出去的
+  // teammate），别再一概说成"子代理"。
+  return `<span class="satellites" aria-label="${satellites.length} 颗卫星">${dots}${overflow}</span>`;
 }
 
 function completionStorageKey(platform, agent) {

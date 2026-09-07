@@ -416,6 +416,10 @@ class Candidate:
     start_s: int | None
     # exe 或脚本任一住在 GUI 应用包里：这种进程没有可切过去的终端标签页。
     bundle_anywhere: bool = False
+    # teammate 进程自报的身份：agent 名字 + 父会话 id（都可能是空串）。
+    # 父会话还活着的话，这个进程该挂成那盏灯的卫星，而不是自己占一张卡。
+    agent_name: str = ""
+    parent_session: str = ""
     members: tuple[int, ...] = ()
 
 
@@ -518,6 +522,37 @@ def parse_argv(command: str) -> Argv:
         region=region,
         in_bundle=script_in_bundle if (interpreter and script) else exe_in_bundle,
         bundle_anywhere=exe_in_bundle or script_in_bundle,
+    )
+
+
+def flag_value(command: str, flag: str) -> str:
+    """取一个 `--flag value` / `--flag=value` 形式的参数值；没有就返回空串。"""
+    tokens = command.split()
+    prefix = f"{flag}="
+    for index, token in enumerate(tokens):
+        if token.startswith(prefix):
+            return token[len(prefix) :]
+        if token == flag and index + 1 < len(tokens):
+            value = tokens[index + 1]
+            return "" if value.startswith("-") else value
+    return ""
+
+
+def team_flags(command: str) -> tuple[str, str]:
+    """Claude teammate 进程自报的身份：`(agent 名字, 父会话 id)`。
+
+    真实命令行长这样（本机 2026-09-07 抓的）：
+        …/versions/2.1.260 --agent-id gh-search@session-af37fb6d
+        --agent-name gh-search --team-name session-af37fb6d --agent-color blue
+        --parent-session-id af37fb6d-… --agent-type general-purpose …
+
+    这些进程在 `~/.claude/sessions/` 里只写 `.key`、不写 `.json`，所以登记表
+    认领不到它们，只能从命令行认。
+    """
+    if "--parent-session-id" not in command and "--agent-name" not in command:
+        return "", ""
+    return flag_value(command, "--agent-name"), flag_value(
+        command, "--parent-session-id"
     )
 
 
@@ -1004,6 +1039,7 @@ def classify(
             expanded, home_label = found_home, display_home(found_home, home)
         watch = tuple(profile.get("watch") or ()) or DEFAULT_WATCH
         argv = parse_argv(commands[root])
+        agent_name, parent_session = team_flags(commands[root])
         candidates.append(
             Candidate(
                 pid=root,
@@ -1020,6 +1056,8 @@ def classify(
                 command=commands[root],
                 start_s=_start_of(starts, root),
                 bundle_anywhere=argv.bundle_anywhere,
+                agent_name=agent_name,
+                parent_session=parent_session,
                 members=tuple(pids),
             )
         )

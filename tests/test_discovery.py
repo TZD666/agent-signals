@@ -134,6 +134,15 @@ WORKBUDDY_SANDBOX = (
     "/Users/edy/.workbuddy/binaries/sandbox-center "
     '--config {"appHome":"/Users/edy/.workbuddy","port":63296}'
 )
+PARENT_SID = "af37fb6d-5c6b-4e6e-8642-736b4798f617"
+TEAMMATE = (
+    "/Users/edy/.local/share/claude/versions/2.1.260 "
+    "--agent-id gh-search@session-af37fb6d --agent-name gh-search "
+    "--team-name session-af37fb6d --agent-color blue "
+    f"--parent-session-id {PARENT_SID} "
+    "--agent-type general-purpose --permission-mode acceptEdits --model sonnet"
+)
+TEAMMATE_TWO = TEAMMATE.replace("gh-search", "hf-search").replace("blue", "green")
 DSH_NODE = (
     "/opt/homebrew/Cellar/node/24.4.0/bin/node "
     "/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js web --no-open"
@@ -1163,6 +1172,214 @@ class DiscoveredOpenTests(unittest.TestCase):
             with patch.object(server, "STATE_PATH", Path(directory) / "state.json"):
                 server._acknowledged_completions.clear()
                 self.assertTrue(server.acknowledge_agent(agent))
+
+
+def claude_light(session_id, satellites=None):
+    """一盏登记表出的前台 Claude 灯（形状取自 load_claude_sessions）。"""
+    return {
+        "id": session_id,
+        "pid": 29796,
+        "platform": "claude",
+        "name": "edy-b0",
+        "status": "thinking",
+        "detail": "Terminal",
+        "cwd": "/Users/edy/work",
+        "cwdLabel": "work",
+        "updatedAt": 1_000,
+        "quietSince": 1_000,
+        "completionId": 0,
+        "openable": True,
+        "origin": "registry",
+        "openVia": "tty",
+        "load": {"contextTokens": 1000, "contextWindow": 200000,
+                 "contextPct": 1, "stepGapMs": None},
+        "satellites": list(satellites or []),
+    }
+
+
+class TeamFlagTests(unittest.TestCase):
+    def test_team_flags_reads_the_real_command_line(self):
+        name, parent = discovery.team_flags(TEAMMATE)
+        self.assertEqual(name, "gh-search")
+        self.assertEqual(parent, PARENT_SID)
+
+    def test_team_flags_accepts_the_equals_form(self):
+        name, parent = discovery.team_flags(
+            "claude --agent-name=exec-runway --parent-session-id=7b582fcb"
+        )
+        self.assertEqual((name, parent), ("exec-runway", "7b582fcb"))
+
+    def test_team_flags_is_empty_for_an_ordinary_session(self):
+        self.assertEqual(discovery.team_flags(CLAUDE_LOCAL), ("", ""))
+        self.assertEqual(discovery.team_flags(DSH_NODE), ("", ""))
+
+    def test_a_flag_without_a_value_is_not_a_value(self):
+        self.assertEqual(
+            discovery.flag_value("claude --agent-name --parent-session-id x", "--agent-name"),
+            "",
+        )
+
+    def test_candidate_carries_the_team_identity(self):
+        result = run([(71086, 71074, UID, TEAMMATE)])
+        self.assertEqual(len(result.candidates), 1)
+        candidate = result.candidates[0]
+        self.assertEqual(candidate.family, "claude")
+        self.assertEqual(candidate.agent_name, "gh-search")
+        self.assertEqual(candidate.parent_session, PARENT_SID)
+
+
+class TeammateSatelliteTests(unittest.TestCase):
+    """天幕低语排出去的 teammate 应该环绕在父灯周围，不是另起一张卡。"""
+
+    def setUp(self):
+        server._discovery_state.clear()
+        server._discovery_transitions.clear()
+        server._discovery_cwd.clear()
+        server._activity.clear()
+        for target in (
+            server._discovery_state,
+            server._discovery_transitions,
+            server._discovery_cwd,
+            server._activity,
+        ):
+            self.addCleanup(target.clear)
+        patches = [
+            patch.object(server, "process_cwd", return_value="/Users/edy/memory"),
+            patch.object(server, "watch_mtime", return_value=0.0),
+            patch.object(server, "claude_claimed_pids", return_value=set()),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def load(self, rows, hosts=None):
+        context = {"loaded": [("claude", list(hosts or []), {"state": "live"})]}
+        return server.load_discovered(1_700_000_000_000, table(rows), context)
+
+    def test_teammate_becomes_a_satellite_of_its_parent_light(self):
+        host = claude_light(PARENT_SID)
+        agents, health = self.load(
+            [
+                (71086, 71074, UID, TEAMMATE, 1_000),
+                (71174, 71074, UID, TEAMMATE_TWO, 1_000),
+            ],
+            [host],
+        )
+        # 一张卡都不该多出来。
+        self.assertEqual(agents, [])
+        self.assertEqual(
+            [item["name"] for item in host["satellites"]], ["gh-search", "hf-search"]
+        )
+        self.assertTrue(all(s["origin"] == "teammate" for s in host["satellites"]))
+        self.assertIn("2 个挂成卫星", health["detail"])
+
+    def test_satellites_carry_no_load(self):
+        host = claude_light(PARENT_SID)
+        self.load([(71086, 71074, UID, TEAMMATE, 1_000)], [host])
+        satellite = host["satellites"][0]
+        self.assertNotIn("load", satellite)
+        self.assertEqual(
+            sorted(satellite), ["completionId", "id", "name", "origin", "status"]
+        )
+
+    def test_an_orphan_teammate_still_gets_its_own_light(self):
+        # 父会话不在登记表里：找不到爹不是让一个真在跑的进程凭空消失的理由。
+        agents, _health = self.load([(71086, 71074, UID, TEAMMATE, 1_000)], [])
+        self.assertEqual(len(agents), 1)
+        self.assertEqual(agents[0]["platform"], "claude")
+        self.assertEqual(agents[0]["name"], "gh-search")
+        self.assertEqual(agents[0]["origin"], "process")
+
+    def test_no_context_means_no_host_and_no_disappearing_act(self):
+        # 老调用方（不传 context）行为不变：照样单独出灯。
+        agents, _health = server.load_discovered(
+            1_700_000_000_000, table([(71086, 71074, UID, TEAMMATE, 1_000)])
+        )
+        self.assertEqual([a["name"] for a in agents], ["gh-search"])
+
+    def test_teammate_and_task_subagent_satellites_coexist(self):
+        # Phase 2 的 Task 子代理卫星（origin=subagent）与 teammate 卫星
+        # 挂在同一盏灯下，互不打架。
+        existing = {
+            "id": "agent-af7008f09f2924b4e",
+            "name": "Explore · 盘点天幕低语公司资料",
+            "status": "thinking",
+            "completionId": 0,
+            "origin": "subagent",
+        }
+        host = claude_light(PARENT_SID, [existing])
+        self.load([(71086, 71074, UID, TEAMMATE, 1_000)], [host])
+        self.assertEqual(
+            [(s["name"], s["origin"]) for s in host["satellites"]],
+            [
+                ("Explore · 盘点天幕低语公司资料", "subagent"),
+                ("gh-search", "teammate"),
+            ],
+        )
+
+    def test_the_same_process_is_never_attached_twice(self):
+        # 一个 id 一颗卫星：今天两类卫星的 id 空间不重叠，这道去重是把这条
+        # 不变量钉死，免得将来某一边改了命名就悄悄出现两颗。
+        host = claude_light(PARENT_SID)
+        rows = [(71086, 71074, UID, TEAMMATE, 1_000)]
+        self.load(rows, [host])
+        self.assertEqual(len(host["satellites"]), 1)
+        duplicate = dict(host["satellites"][0])
+        duplicate["name"] = "别的名字"
+        host["satellites"].append(duplicate)
+        host["satellites"].pop(0)
+        self.load(rows, [host])
+        # 同一个 id 已经在了，不再追加第二颗。
+        self.assertEqual(len(host["satellites"]), 1)
+
+    def test_status_comes_from_the_activity_signal_not_the_transcript(self):
+        host = claude_light(PARENT_SID)
+        rows = [(71086, 71074, UID, TEAMMATE, 1_000)]
+        with patch.object(server, "claude_load") as transcript:
+            for _ in range(3):
+                host["satellites"].clear()
+                self.load(rows, [host])
+        transcript.assert_not_called()
+        self.assertEqual(host["satellites"][0]["status"], "idle")
+
+
+class TeammateCountsTests(unittest.TestCase):
+    """counts.satellites 要把 teammate 算进去，counts.agents 相应减少。"""
+
+    def test_counts_move_from_agents_to_satellites(self):
+        rows = table(
+            [
+                (71086, 71074, UID, TEAMMATE, 1_000),
+                (71174, 71074, UID, TEAMMATE_TWO, 1_000),
+            ]
+        )
+        host = claude_light(PARENT_SID)
+        for target in (
+            server._discovery_state,
+            server._discovery_transitions,
+            server._discovery_cwd,
+            server._activity,
+        ):
+            target.clear()
+            self.addCleanup(target.clear)
+        with patch.object(server, "scan_processes", return_value=rows), patch.object(
+            server, "load_claude_sessions", return_value=([host], {"state": "live", "detail": ""})
+        ), patch.object(
+            server, "load_codex_threads", return_value=([], {"state": "live", "detail": ""})
+        ), patch.object(
+            server, "process_cwd", return_value=""
+        ), patch.object(
+            server, "watch_mtime", return_value=0.0
+        ), patch.object(
+            server, "claude_claimed_pids", return_value=set()
+        ):
+            payload = server.snapshot()
+        claude = next(p for p in payload["platforms"] if p["key"] == "claude")
+        self.assertEqual(len(claude["agents"]), 1)
+        self.assertEqual(len(claude["agents"][0]["satellites"]), 2)
+        self.assertEqual(payload["counts"]["agents"], 1)
+        self.assertEqual(payload["counts"]["satellites"], 2)
+        self.assertEqual(payload["counts"]["byPlatform"], {"claude": 1, "codex": 0})
 
 
 class OpenerRoutingTests(unittest.TestCase):
