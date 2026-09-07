@@ -16,12 +16,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, NamedTuple
+from typing import Any, Callable, Iterable, NamedTuple
 
 SCHEMA_VERSION = 1
 
@@ -50,11 +51,43 @@ CLAIMED_APP_PATHS = ("/Applications/ChatGPT.app/",)
 INTERPRETERS = frozenset({"node", "bun", "deno", "uv", "uvx"})
 PYTHON_RE = re.compile(r"^python\d*(\.\d+)?$")
 SCRIPT_SUFFIXES = (".js", ".mjs", ".cjs", ".py")
+# `-c` / `-e` 后面跟的是内联代码，不是脚本；再往后扫只会把代码片段当成路径。
+INLINE_CODE_FLAGS = frozenset({"-c", "-e", "--eval", "--command"})
 
 
 def is_interpreter(basename: str) -> bool:
     name = basename.lower()
     return name in INTERPRETERS or bool(PYTHON_RE.match(name))
+
+
+# 软链解析的结果：一个运行中进程的可执行文件路径不会变，可以永久缓存。
+_realpath_cache: dict[str, str] = {}
+REALPATH_CACHE_LIMIT = 2000
+
+
+def resolve_path(path: str) -> str:
+    """把一条绝对路径的软链解析开；失败就安静地退回原样。
+
+    ps 显示的是软链本身：npm 全局装的 CLI 是 `/opt/homebrew/bin/dsh`，
+    而种子表里写的包路径片段是 `@deepseek-ai/dsh/`——不解析的话，`paths`
+    那一列对所有全局 npm 安装都是空转，`amp` / `pi` 这种禁止裸名匹配的家族
+    更是 100% 发现不了。
+
+    只解析绝对路径：相对路径会按面板自己的 cwd 解析，那是错的。
+    """
+    if not path.startswith("/"):
+        return path
+    cached = _realpath_cache.get(path)
+    if cached is not None:
+        return cached
+    try:
+        resolved = os.path.realpath(path)
+    except (OSError, ValueError):
+        resolved = path
+    if len(_realpath_cache) > REALPATH_CACHE_LIMIT:
+        _realpath_cache.clear()
+    _realpath_cache[path] = resolved
+    return resolved
 
 # GUI 应用 `.app` 包里的可执行文件只允许种子里写死的路径命中：Electron 应用的
 # 主程序常常就叫 `Electron`/`Helper`，靠 basename 或 dotdir 猜必然误伤。
@@ -352,6 +385,9 @@ class Argv(NamedTuple):
     # 真正说明身份的那个文件：解释器 + 脚本时是脚本，否则就是 exe。
     target: str
     names: tuple[str, ...]
+    # names 里「靠剥掉扩展名才凑出来的」那些，属于弱证据：`~/work/claude.py`
+    # 剥出来的 `claude` 不许点亮原生 Claude 分区。
+    weak_names: frozenset
     region: str
     # 身份文件在不在 GUI 应用包里——种子表的 basename 匹配看这个。
     in_bundle: bool
@@ -423,7 +459,7 @@ def path_region(command: str) -> str:
 
 
 def parse_argv(command: str) -> Argv:
-    """拆出 exe / 脚本 / 用于种子匹配的名字。"""
+    """拆出 exe / 脚本 / 用于种子匹配的名字。纯字符串处理，不碰文件系统。"""
     tokens = command.split()
     exe = tokens[0] if tokens else ""
     basename = exe.rsplit("/", 1)[-1]
@@ -433,19 +469,29 @@ def parse_argv(command: str) -> Argv:
     interpreter = is_interpreter(basename)
     if interpreter:
         for token in tokens[1:]:
+            if token in INLINE_CODE_FLAGS:
+                break
             if token.startswith("-"):
                 continue
-            if token.endswith(SCRIPT_SUFFIXES):
+            # 「像个路径」就够了，不强求扩展名：npm 全局装的 CLI 是一个
+            # **没有扩展名**的软链（`/opt/homebrew/bin/dsh`），只认
+            # `.js/.mjs/.cjs/.py` 的话它永远不会被当成脚本。
+            if "/" in token or token.endswith(SCRIPT_SUFFIXES):
                 script = token
                 break
 
+    weak: set = set()
     if interpreter and script:
-        stem = script.rsplit("/", 1)[-1]
+        script_name = script.rsplit("/", 1)[-1]
+        found: list = [script_name]
         for suffix in SCRIPT_SUFFIXES:
-            if stem.endswith(suffix):
-                stem = stem[: -len(suffix)]
+            if script_name.endswith(suffix):
+                stem = script_name[: -len(suffix)]
+                if stem and stem not in found:
+                    found.append(stem)
+                    weak.add(stem)
                 break
-        names = (stem,)
+        names = tuple(found)
     elif interpreter:
         names = ()
     else:
@@ -468,10 +514,29 @@ def parse_argv(command: str) -> Argv:
         script=script,
         target=target,
         names=names,
+        weak_names=frozenset(weak),
         region=region,
         in_bundle=script_in_bundle if (interpreter and script) else exe_in_bundle,
         bundle_anywhere=exe_in_bundle or script_in_bundle,
     )
+
+
+def paths_text(argv: Argv, resolve: Callable[[str], str] = resolve_path) -> str:
+    """路径片段匹配的对象：命令行的路径区 + 解析过软链的那一条路径。
+
+    种子表的 `paths` 那一列不解析软链就是空转：npm 全局装的 CLI 在 ps 里是
+    `/opt/homebrew/bin/dsh`，而种子里写的是 `@deepseek-ai/dsh/`。
+
+    一个进程只解析一条：有脚本时解析脚本（解释器自己的路径不说明身份），
+    否则解析 exe。解析结果与原路径相同时连字符串都不用拼。
+
+    **只在这里做文件系统调用**，而不是在 parse_argv 里：调用点是规则 3，
+    此时硬排除与「已被认领」都已经筛过一轮了。整机 994 个进程只剩 60 来个
+    走到这一步，冷启动少掉近 600 次 realpath。
+    """
+    origin = argv.script or argv.exe
+    resolved = resolve(origin)
+    return argv.region if resolved == origin else f"{argv.region} {resolved}"
 
 
 # ---------------------------------------------------------------------------
@@ -546,21 +611,26 @@ def _ancestor_claimed(
 
 
 def match_seed(
-    argv: Argv, families: dict[str, Any], native: Iterable[str] = ()
+    argv: Argv,
+    families: dict[str, Any],
+    native: Iterable[str] = (),
+    resolve: Callable[[str], str] = resolve_path,
 ) -> str:
     """种子表精确匹配；返回 family key，没命中返回空串。
 
     先过一轮路径片段（信号强，GUI 应用包里的 exe 只认这一条），再过 basename。
 
-    `native` 是有原生数据源的平台 key。解释器 + 脚本时，能拿来比的只有脚本去掉
-    后缀的名字，那是**弱证据**：`python3 ~/work/claude.py` 会命中 `claude`，在
-    原生 Claude 分区里冒出一盏 tty 可点的假灯（而 `./claude.py` 直接跑反倒不会，
-    自己都不自洽）。所以原生平台只认真正的可执行文件名。
+    `native` 是有原生数据源的平台 key。**剥掉扩展名**才凑出来的名字是弱证据：
+    `python3 ~/work/claude.py` 会命中 `claude`，在原生 Claude 分区里冒出一盏
+    tty 可点的假灯（而 `./claude.py` 直接跑反倒不会，自己都不自洽）。所以弱名
+    不许点亮原生平台。没剥过后缀的名字（`node /opt/homebrew/bin/dsh` 里的
+    `dsh` 这种 npm 全局软链）是强证据，照常匹配。
     """
     ordered = sorted(families.items())
+    text = paths_text(argv, resolve)
     for key, profile in ordered:
         for fragment in ((profile.get("match") or {}).get("paths") or ()):
-            if fragment and fragment in argv.region:
+            if fragment and fragment in text:
                 return key
     if argv.in_bundle:
         return ""
@@ -569,7 +639,7 @@ def match_seed(
         for name in ((profile.get("match") or {}).get("basenames") or ()):
             if not name or name not in argv.names:
                 continue
-            if argv.script and key in native_keys:
+            if name in argv.weak_names and key in native_keys:
                 continue
             return key
     return ""

@@ -143,6 +143,32 @@ OPENCLAW_NODE = (
 )
 
 
+class FakeLinks:
+    """本机 /opt/homebrew/bin 里那几个 npm 全局软链的真实指向。
+
+    夹具不去碰真实文件系统：CI 或别人的机器上这些包不一定装着。
+    `/opt/homebrew/bin/amp` 本机没装，按 npm 的固定布局写。
+    """
+
+    LINKS = {
+        "/opt/homebrew/bin/dsh": (
+            "/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"
+        ),
+        "/opt/homebrew/bin/openclaw": (
+            "/opt/homebrew/lib/node_modules/openclaw/openclaw.mjs"
+        ),
+        "/opt/homebrew/bin/amp": (
+            "/opt/homebrew/lib/node_modules/@sourcegraph/amp/dist/index.js"
+        ),
+    }
+
+    def get_or_self(self, path):
+        return self.LINKS.get(path, path)
+
+
+FAKE_LINKS = FakeLinks()
+
+
 def table(rows):
     """rows: (pid, ppid, uid, command[, start_s]) → 一份 ps 表。"""
     built = {"children": {}, "cpu": {}, "commands": {}, "start_s": {}, "uid": {}}
@@ -179,8 +205,10 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(argv.exe, "node")
         self.assertEqual(argv.basename, "node")
         self.assertTrue(argv.script.endswith("bridge/mcp-server.cjs"))
-        # 解释器自己不说明身份，脚本名才说明。
-        self.assertEqual(argv.names, ("mcp-server",))
+        # 解释器自己不说明身份，脚本名才说明：完整 basename 与去后缀的 stem
+        # 都参与匹配，但 stem 是弱证据。
+        self.assertEqual(argv.names, ("mcp-server.cjs", "mcp-server"))
+        self.assertEqual(argv.weak_names, frozenset({"mcp-server"}))
         self.assertFalse(argv.in_bundle)
 
     def test_framework_python_is_still_an_interpreter(self):
@@ -194,7 +222,7 @@ class ArgvTests(unittest.TestCase):
         )
         argv = discovery.parse_argv(command)
         self.assertEqual(argv.script, "/Users/edy/.fakeagent/run.py")
-        self.assertEqual(argv.names, ("run",))
+        self.assertEqual(argv.names, ("run.py", "run"))
         self.assertFalse(argv.in_bundle)
         # 解释器自己的 bundle 不是 GUI 应用：连 bundle_anywhere 都不该亮，
         # 否则 dotdir 规则会把所有 python 写的 agent 一并豁免掉。
@@ -271,6 +299,122 @@ class SeedMatchTests(unittest.TestCase):
         result = run([(4242, 1, UID, CLAUDE_DESKTOP_BUNDLED)])
         self.assertEqual(families(result), ["claude"])
         self.assertEqual(result.candidates[0].source, "seed")
+
+    def test_seed_matches_a_global_npm_shim_without_a_suffix(self):
+        # 真机实测的那条命令行（`dsh web --no-open` 起来之后 ps 就长这样）。
+        # npm 全局装的 CLI 是一个**没有扩展名**的软链：
+        #   /opt/homebrew/bin/dsh -> ../lib/node_modules/@deepseek-ai/dsh/lib/bin.js
+        # 只认 .js/.mjs/.cjs/.py 的话它连「脚本」都算不上，basename `dsh`
+        # 永远匹配不上；而 ps 显示的是软链本身，包路径片段也不在命令行里。
+        command = "node /opt/homebrew/bin/dsh web --no-open"
+        argv = discovery.parse_argv(command)
+        self.assertEqual(argv.script, "/opt/homebrew/bin/dsh")
+        self.assertEqual(argv.names, ("dsh",))
+        self.assertEqual(argv.weak_names, frozenset())
+        self.assertIn(
+            "@deepseek-ai/dsh/",
+            discovery.paths_text(argv, resolve=FAKE_LINKS.get_or_self),
+        )
+        self.assertEqual(
+            discovery.match_seed(
+                argv,
+                discovery.DEFAULT_PROFILES["families"],
+                resolve=FAKE_LINKS.get_or_self,
+            ),
+            "dsh",
+        )
+
+    def test_seed_matches_an_mjs_symlink_shim(self):
+        # openclaw 的软链指向 .mjs，形状与 dsh 不同，两条路都要走通。
+        command = "node /opt/homebrew/bin/openclaw gateway"
+        argv = discovery.parse_argv(command)
+        self.assertEqual(argv.names, ("openclaw",))
+        self.assertIn(
+            "node_modules/openclaw/",
+            discovery.paths_text(argv, resolve=FAKE_LINKS.get_or_self),
+        )
+        self.assertEqual(
+            discovery.match_seed(
+                argv,
+                discovery.DEFAULT_PROFILES["families"],
+                resolve=FAKE_LINKS.get_or_self,
+            ),
+            "openclaw",
+        )
+
+    def test_path_fragment_only_families_need_the_symlink_resolved(self):
+        # amp / pi 禁止裸名匹配，路径片段是它们唯一的路：不解析软链就是
+        # 100% 发现不了。
+        argv = discovery.parse_argv("node /opt/homebrew/bin/amp --execute")
+        self.assertEqual(
+            discovery.match_seed(
+                argv,
+                discovery.DEFAULT_PROFILES["families"],
+                resolve=lambda path: path,
+            ),
+            "",
+        )
+        self.assertEqual(
+            discovery.match_seed(
+                argv,
+                discovery.DEFAULT_PROFILES["families"],
+                resolve=FAKE_LINKS.get_or_self,
+            ),
+            "amp",
+        )
+
+    def test_realpath_failure_falls_back_to_the_unresolved_path(self):
+        def boom(path):
+            raise OSError("没这个文件")
+
+        # 解析失败不能把整轮采样带崩；退回未解析的路径继续匹配。
+        argv = discovery.parse_argv(
+            "node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"
+        )
+        self.assertEqual(
+            discovery.match_seed(
+                argv,
+                discovery.DEFAULT_PROFILES["families"],
+                resolve=lambda path: path,
+            ),
+            "dsh",
+        )
+        with patch.object(discovery.os.path, "realpath", side_effect=boom):
+            discovery._realpath_cache.clear()
+            self.addCleanup(discovery._realpath_cache.clear)
+            self.assertEqual(
+                discovery.resolve_path("/opt/homebrew/bin/dsh"),
+                "/opt/homebrew/bin/dsh",
+            )
+            fallback = discovery.parse_argv("node /opt/homebrew/bin/dsh web")
+        # 软链没解析开，就只剩 basename 那条路——它照样把 dsh 认出来。
+        self.assertEqual(
+            discovery.match_seed(fallback, discovery.DEFAULT_PROFILES["families"]),
+            "dsh",
+        )
+
+    def test_resolve_path_leaves_relative_paths_alone(self):
+        # 相对路径会按面板自己的 cwd 解析，那是错的。
+        self.assertEqual(discovery.resolve_path("./server.mjs"), "./server.mjs")
+        self.assertEqual(discovery.resolve_path("node"), "node")
+
+    def test_resolve_path_caches_by_string(self):
+        discovery._realpath_cache.clear()
+        self.addCleanup(discovery._realpath_cache.clear)
+        with patch.object(
+            discovery.os.path, "realpath", return_value="/resolved"
+        ) as real:
+            for _ in range(5):
+                discovery.resolve_path("/opt/homebrew/bin/dsh")
+        # 一个运行中进程的路径不会变：热路径上一次文件系统都不该再碰。
+        self.assertEqual(real.call_count, 1)
+
+    def test_inline_code_is_never_mistaken_for_a_script(self):
+        argv = discovery.parse_argv(
+            "python3 -c import sys; sys.path.append('/opt/claude/x')"
+        )
+        self.assertEqual(argv.script, "")
+        self.assertEqual(argv.names, ())
 
     def test_seed_matches_dsh_and_openclaw_node_scripts(self):
         result = run(
@@ -1232,6 +1376,43 @@ class DiscoverySourceTests(unittest.TestCase):
             sorted(agent["platform"] for agent in agents),
             ["claude", "dsh", "openclaw"],
         )
+
+    def test_global_npm_shim_becomes_a_light_with_a_url_entrance(self):
+        # 端到端：真机 `dsh web --no-open` 的那条 ps 行 → 一盏挂在 dsh 分区、
+        # 点得开 http://127.0.0.1:3080 的灯。验收项 (a) 就是这条。
+        rows = table([(84760, 1, UID, "node /opt/homebrew/bin/dsh web --no-open", 1_000)])
+        with patch.object(server, "process_cwd", return_value="/Users/edy/work"), (
+            patch.object(server, "watch_mtime", return_value=0.0)
+        ), patch.object(server, "claude_claimed_pids", return_value=set()), (
+            patch.object(server, "port_listening", return_value=True)
+        ), patch.object(
+            discovery, "resolve_path", side_effect=FAKE_LINKS.get_or_self
+        ):
+            agents, health = server.load_discovered(1_700_000_000_000, rows)
+        self.assertEqual(health["state"], "live")
+        self.assertEqual(len(agents), 1)
+        light = agents[0]
+        self.assertEqual(light["platform"], "dsh")
+        self.assertEqual(light["name"], "DeepSeek Harness · work")
+        self.assertEqual(light["detail"], "自动发现 · ~/.dsh")
+        self.assertEqual(light["openVia"], "url:3080")
+        self.assertTrue(light["openable"])
+        self.assertEqual(server.platform_meta("dsh")["order"], 10)
+
+    def test_url_entrance_is_withheld_when_nobody_listens(self):
+        rows = table([(84760, 1, UID, "node /opt/homebrew/bin/dsh web", 1_000)])
+        with patch.object(server, "process_cwd", return_value=""), patch.object(
+            server, "watch_mtime", return_value=0.0
+        ), patch.object(
+            server, "claude_claimed_pids", return_value=set()
+        ), patch.object(
+            server, "port_listening", return_value=False
+        ), patch.object(
+            discovery, "resolve_path", side_effect=FAKE_LINKS.get_or_self
+        ):
+            agents, _health = server.load_discovered(1_700_000_000_000, rows)
+        self.assertEqual(agents[0]["openVia"], "")
+        self.assertFalse(agents[0]["openable"])
 
     def test_truncation_is_reported_in_health(self):
         rows = table(

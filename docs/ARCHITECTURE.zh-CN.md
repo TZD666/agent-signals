@@ -136,9 +136,17 @@
    面板只能靠 `os.getpid()` 排除自己。
 3. **种子表**：basename 精确相等，或 exe / 脚本路径含包片段（`@openai/codex/`、
    `@deepseek-ai/dsh/`、`/Applications/WorkBuddy.app/` 之类）。`argv[0]` 是解释器
-   （`node`/`bun`/`deno`/`python*`/`uv`）时看后面第一个 `.js/.mjs/.cjs/.py` 参数。
-   `.app` 包里的可执行文件**只认种子里写死的路径**——Electron 应用的主程序常常
-   就叫 `Electron`，靠名字猜必然误伤。
+   （`node`/`bun`/`deno`/`python*`/`uv`）时看后面第一个**像路径**的参数——不强求
+   `.js/.mjs/.cjs/.py` 后缀，因为 npm 全局装的 CLI 是一个没有扩展名的软链
+   （`/opt/homebrew/bin/dsh`）。路径片段拿**解析过软链**的路径去比：ps 显示的是
+   软链本身，而种子里写的是包路径（`dsh` 的软链指向
+   `…/node_modules/@deepseek-ai/dsh/lib/bin.js`）；不解析的话 `paths` 那一列对
+   全局 npm 安装完全空转，而 `amp` / `pi` 这类禁止裸名匹配的家族只有这一条路。
+   解析结果按路径字符串永久缓存（运行中进程的路径不会变），失败就退回未解析的
+   路径；而且只在规则 3 这一步做，硬排除与「已被认领」筛过之后整机只剩几十个
+   进程需要解析。剥掉扩展名才凑出来的名字（`~/work/claude.py` 的 `claude`）是
+   弱证据，不许点亮原生平台。`.app` 包里的可执行文件**只认种子里写死的路径**
+   ——Electron 应用的主程序常常就叫 `Electron`，靠名字猜必然误伤。
 4. **动态 dotdir**：命令里出现 `~/.<name>/`、`~/.config/<name>/` 或
    `~/Library/Application Support/<Name>/`，且那个目录看起来像 agent 的状态目录
    （含 `sessions/`、`threads/`、`conversations/`、`history.jsonl`、`rollout-*.jsonl`
