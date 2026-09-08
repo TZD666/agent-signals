@@ -263,7 +263,9 @@ function satelliteMarkup(satellites) {
     satellites.length > 8
       ? `<span class="satellite-overflow">+${satellites.length - 8}</span>`
       : "";
-  return `<span class="satellites" aria-label="${satellites.length} 个子代理">${dots}${overflow}</span>`;
+  // 卫星现在有三种来路（登记表后台会话 / Task 子代理 / team 里排出去的
+  // teammate），别再一概说成"子代理"。
+  return `<span class="satellites" aria-label="${satellites.length} 颗卫星">${dots}${overflow}</span>`;
 }
 
 function completionStorageKey(platform, agent) {
@@ -372,6 +374,7 @@ function cardMarkup(agent, platform) {
         <span class="agent-copy">
           <span class="agent-name" title="${escapeHtml(agent.name)}">${escapeHtml(agent.name)}</span>
           ${agent.detail ? `<span class="agent-detail">${escapeHtml(agent.detail)}</span>` : ""}
+          ${agent.origin === "process" ? `<span class="agent-origin">未登记进程</span>` : ""}
           <span class="agent-state">${escapeHtml(status)}</span>
           ${note ? `<span class="agent-note">${escapeHtml(note)}</span>` : ""}
           ${loadMarkup(agent)}

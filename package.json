@@ -30,6 +30,7 @@
     "bin/",
     "static/",
     "server.py",
+    "discovery.py",
     "requirements.txt",
     "README.md",
     "README.zh-CN.md",

@@ -39,9 +39,10 @@
 
 ## 卫星
 
-主灯外围的小卫星点有两种来路：
+主灯外围的小卫星点有三种来路：
 
 - **登记表卫星**：`claude --bg` 后台会话，以及被某个会话拉起来的 `claude -p`。挂靠改成沿 PPID 链上溯（≤8 层）找真正的父会话，找不到才退回原来的"同目录 / 最近活跃"猜测——之前同目录的另一盏灯会把它抢走。
+- **teammate 卫星**：team 里排出去的 agent。它们在 `~/.claude/sessions/` 里只写 `.key` 不写 `.json`，登记表认领不到，所以由自动发现认出来；命令行里带 `--parent-session-id`，指向登记表里某个还活着的会话时就挂成那盏灯的卫星，名字取 `--agent-name`（`gh-search` / `exec-runway`，正是用户在自己的 team 界面里看到的那个）。状态走自动发现那套活动信号，不读 transcript。**父会话不在登记表里（孤儿）时仍然单独出灯**——找不到父灯不是让一个真在跑的进程凭空消失的理由。
 - **子代理卫星**：Task 子代理（`<transcript 目录>/<sessionId>/subagents/agent-*.jsonl`）。它没有结束标记，只能看 jsonl 的 mtime：`AGENT_SIGNALS_SUBAGENT_ACTIVE_MS`（60 秒）内有写入算思考中，之后转已完成，静默超过 `AGENT_SIGNALS_SUBAGENT_LINGER_MS`（10 分钟）不再显示。只 stat 文件加读同名的小 `.meta.json`，一个字对话内容都不读；这类卫星只作展示，不参与完成确认。
 
 ## 疑似卡死怎么判定
@@ -85,7 +86,7 @@
 ./deploy.sh
 ```
 
-四步固定顺序：跑测试（用 launchd 里那个 `/usr/bin/python3`）→ 拷 `server.py` 与 `static/*` 到运行目录（`discovery.py`、`cloud.py` 存在才拷，它们是后续阶段才出现的模块）→ `launchctl kickstart -k` 重启服务 → 轮询 `/health` 直到 `version` 与 `server.py` 里的 `APP_VERSION` 对上、**并且** `pid` 与重启前不同（20 秒超时，超时会打印 `agent-signals.err.log` 末尾并非零退出）。测试不过就一个文件都不拷。
+四步固定顺序：跑测试（用 launchd 里那个 `/usr/bin/python3`）→ 拷 `server.py`、`discovery.py` 与 `static/*` 到运行目录（`discovery.py` 自 2.3.0 起无条件拷贝：`server.py` 启动时按路径加载它，缺了就起不来，所以宁可在 `cp` 这一步失败；`cloud.py` 仍是存在才拷，它到 Phase 7 才出现）→ `launchctl kickstart -k` 重启服务 → 轮询 `/health` 直到 `version` 与 `server.py` 里的 `APP_VERSION` 对上、**并且** `pid` 与重启前不同（20 秒超时，超时会打印 `agent-signals.err.log` 末尾并非零退出）。测试不过就一个文件都不拷。
 
 比 pid 是必要的：`APP_VERSION` 在同一阶段内是不变的手写常量，只比版本号的话，端口被别的野进程占着、新进程根本没起来时，老进程会用同一个版本号把健康检查骗过去。
 
@@ -97,7 +98,7 @@
 
 ```
 {
-  "schemaVersion": 2, "generatedAt": …, "version": "2.2.0",
+  "schemaVersion": 2, "generatedAt": …, "version": "2.3.4",
   "sources":       { "<源 key>": {state, detail} },      // 采集端健康度，按来源
   "notifications": {state, detail},
   "platforms": [
@@ -110,13 +111,118 @@
 }
 ```
 
-分区按 **`agent["platform"]` 归堆**，不是按来源切：一个来源可以交出好几个平台的灯（自动发现的运行时就挂在采到它的那个源下）。排序按 `(order, key)`。每个分区的展示元数据来自 `platform_meta()`——先问原生 `SOURCES`（label / order / kind / hint / dismissible / lockable / empty_text 都在 `SourceSpec` 上），再问 `FAMILY_META`（自动发现的家族表，Phase 3 先留空），最后兜底成 `{label: key 首字母大写, order: 90, kind: "discovered"}`。原生平台**即使一盏灯都没有也会出现**，否则它的空态与「数据源不可用」没有地方渲染；非原生平台只在有灯时出现，健康度跟着产出它的那个来源走。源 key 与载荷根键撞名会在注册表建好的当场抛错（`check_source_keys`）。
+分区按 **`agent["platform"]` 归堆**，不是按来源切：一个来源可以交出好几个平台的灯（自动发现的运行时就挂在采到它的那个源下）。排序按 `(order, key)`。每个分区的展示元数据来自 `platform_meta()`——先问原生 `SOURCES`（label / order / kind / hint / dismissible / lockable / empty_text 都在 `SourceSpec` 上），再问 `FAMILY_META`（自动发现的家族表：种子画像在启动时一次性登记，动态 dotdir 认出来的家族现登记；写进这张表的键名认不出来会当场抛 `ValueError`，内部表写错就该早点炸，不该无声丢弃），最后兜底成 `{label: key 首字母大写, order: 90, kind: "discovered"}`。原生平台**即使一盏灯都没有也会出现**，否则它的空态与「数据源不可用」没有地方渲染；非原生平台只在有灯时出现，健康度跟着产出它的那个来源走。只有一个例外：既不是平台、又读不到数据的扇出源（自动发现就是）会自己占一块分区写明原因。源 key 与载荷根键撞名会在注册表建好的当场抛错（`check_source_keys`）。
 
-`/api/open` 的平台白名单也跟着放宽：只要平台出现在最近一轮载荷里就受理；没有登记 `open` 回调的平台（自动发现的那些）不打开任何窗口，只走确认分支，返回 `{"ok": true, "opened": false, …}`。
+`/api/open` 的平台白名单也跟着放宽：只要平台出现在最近一轮载荷里就受理。原生源用自己登记的 `open` 回调，自动发现的平台按灯上的 `openVia` 分派（那是服务端上一轮自己算出来的，不是请求体给的），两样都没有的灯不打开任何窗口，只走确认分支，返回 `{"ok": true, "opened": false, …}`。
 
 前端相应地不再把分区写死在 HTML 里：`static/index.html` 只留一个 `<div id="platforms">` 和一份 `<template id="platformSection">`，`app.js` 按 `data.platforms` 惰性克隆出分区、平台消失就整块移除，序号 `01/02/03…` 是排序后的位次。🔒 / × 两个按钮由 `lockable` / `dismissible` 决定，空态文案取 `emptyText`，历史面板的平台标签取 `label`。重建签名只包含 `{key, health, 剔掉 load 的可见灯}`，签名不变就只给负载条打补丁，卡片 DOM 不重建（轨道动画相位靠这个）。
 
 隐藏与锁定的浏览器存储从写死平台的 `agent-signals.dismissed-codex` / `agent-signals.locked-codex` 改成一平台一桶的 `agent-signals.dismissed.<平台 key>` / `agent-signals.locked.<平台 key>`，老键在启动时搬进 `codex` 桶后删除（幂等）。
+
+## 自动发现（没有原生数据源的运行时）
+
+面板不只认 Claude 与 Codex。每轮采样的那份 `ps` 表还会过一遍发现引擎
+（`discovery.py`，纯函数、不 import server），把「本机正在跑、但没有原生数据源」
+的 agent 运行时认出来，各自成一个平台分区。**装上就出现，不用改配置。**
+
+分类严格按顺序，命中即停：
+
+1. **硬排除**：不是当前 uid 的；exe 以 `/System/`、`/usr/libexec/`、`/usr/sbin/`、
+   `/Library/Apple/` 开头的；命令里带 `--type=`（Electron/Chromium 的 helper）或
+   `--bg-spare` 的；黑名单 basename（`AMPDeviceDiscoveryAgent`、`AMPLibraryAgent`、
+   `CursorUIViewService`、`CodexBar`）与路径（`Battle.net`）。
+2. **已被原生源认领**：`~/.claude/sessions/*.json` 里登记的 pid 及其全部子孙
+   （MCP 子进程跟着一起走）、`/Applications/ChatGPT.app/` 那棵树（Codex 的灯由
+   ChatGPT 的 sqlite 出）、以及面板自己的 pid。部署路径与仓库路径不是一回事，
+   面板只能靠 `os.getpid()` 排除自己。
+3. **种子表**：basename 精确相等，或 exe / 脚本路径含包片段（`@openai/codex/`、
+   `@deepseek-ai/dsh/`、`/Applications/WorkBuddy.app/` 之类）。`argv[0]` 是解释器
+   （`node`/`bun`/`deno`/`python*`/`uv`）时看后面第一个**像路径**的参数——不强求
+   `.js/.mjs/.cjs/.py` 后缀，因为 npm 全局装的 CLI 是一个没有扩展名的软链
+   （`/opt/homebrew/bin/dsh`）。路径片段拿**解析过软链**的路径去比：ps 显示的是
+   软链本身，而种子里写的是包路径（`dsh` 的软链指向
+   `…/node_modules/@deepseek-ai/dsh/lib/bin.js`）；不解析的话 `paths` 那一列对
+   全局 npm 安装完全空转，而 `amp` / `pi` 这类禁止裸名匹配的家族只有这一条路。
+   解析结果按路径字符串永久缓存（运行中进程的路径不会变），失败就退回未解析的
+   路径；而且只在规则 3 这一步做，硬排除与「已被认领」筛过之后整机只剩几十个
+   进程需要解析。剥掉扩展名才凑出来的名字（`~/work/claude.py` 的 `claude`）是
+   弱证据，不许点亮原生平台。`.app` 包里的可执行文件**只认种子里写死的路径**
+   ——Electron 应用的主程序常常就叫 `Electron`，靠名字猜必然误伤。
+4. **动态 dotdir**：命令里出现 `~/.<name>/`、`~/.config/<name>/` 或
+   `~/Library/Application Support/<Name>/`，且那个目录看起来像 agent 的状态目录
+   （含 `sessions/`、`threads/`、`conversations/`、`history.jsonl`、`rollout-*.jsonl`
+   之一；或深度 ≤2 的 sqlite 里有名含 session/thread/conversation/run/message 的表；
+   或 `settings.*` + `profiles/`），就现推一个家族出来。每个目录 10 分钟只判一次。
+   缓存、包管理器、编辑器目录（`.npm`、`.cache`、`.git`、`.vscode`…）与面板自己的
+   运行目录在黑名单里；`.claude` / `.codex` 也在——它们有原生源，动态规则对它们
+   只剩假阳性（凡是读一下 `~/.claude` 的 hook / statusline / MCP 进程都会中招）。
+5. **归并**（三条，依次执行）：候选的祖先（≤8 层）也是**同一家族**的候选就并进
+   祖先；掉队的孤儿 helper 并回同一个 GUI 应用包里的那个实例（macOS 会把 helper
+   重挂到 launchd，父子链在那时是断的——WorkBuddy 的 crashpad 就是 `ppid = 1`）
+   ——**只并叶子**，被并走的那个根自己不能有子进程、接收方必须有，否则两个真正
+   独立的实例（重启时新旧并存、或者应用允许多开）会被合成一张卡、其中一个会话
+   直接消失；最后，dotdir 规则推出来的候选**绝不给已经有种子画像的家族另立
+   门户**——只是在参数里提到 `~/.workbuddy/` 的插件 MCP server 与临时 zsh 并进
+   那盏灯当成员，那盏灯不在就整条丢掉（丢弃数会报进健康度，不静默）。验收标准
+   是「WorkBuddy 出现，且只有一盏灯」。
+6. **上限** `AGENT_SIGNALS_DISCOVERY_MAX_AGENTS`（24），超出按启动时间最新优先，
+   健康度里写明截断了几个。
+
+发现型的灯没有登记表可读，状态全靠推：进程树 CPU 增量或状态目录里 watch 文件的
+mtime 变了就算「动过」，`AGENT_SIGNALS_DISCOVERY_ACTIVE_MS`（20 秒）内动过是思考中，
+静下来即转已完成。
+
+**活动信号必须反映「在干活」，不是「进程活着」**，这条是本机踩出来的：WorkBuddy
+的 `logs/*.log` 每几秒写一次（Electron 的 renderer/daemon 日志），`sessions/*.json`
+每整 30 秒重写一次（`lastHeartbeat` 心跳）；把它们当活动信号，`quietSince` 每轮都
+被刷新，忙→闲那一跳永远不发生，**绿灯在物理上不可能出现**。动态家族的默认 glob
+也因此去掉了 `*.log`。同理，**GUI 应用包里的候选不看 CPU 增量**——空转 24 个 5 秒
+窗口里有 11 个越过 `CPU_EPSILON`、峰值 1.0 秒，渲染进程本来就一直在烧 CPU，这个
+信号在 GUI 应用上分不开「开着」和「在干活」。终端里的 agent 不受影响，照旧看 CPU。
+
+反过来也会错：**只盯一个写得太稀的文件，灯会没干完就转绿**——「没干完却说干完了」
+比「干完了不吭声」更贵。09-04 那次 WorkBuddy 会话的磁盘取证：134 秒的真实工作里
+`traces/` 只写了 1 次（17:11:10），而文件修改一直持续到 17:13:02。所以 WorkBuddy
+除了 traces 还盯 `workspace/sessions/*/modify_backup/*` 与同目录的
+`.modify_backup_meta/*`（文件修改备份，贯穿整个任务）。
+
+但**光加 glob 不够**：那次任务写盘的间隔是 22 / 93 / 10 / 9 秒，中间最长 93 秒完全
+不写盘（agent 在等模型返回），远超默认的 20 秒窗口。所以画像可以给自己一个更有耐心
+的窗口：`activeMs`。WorkBuddy 取 120 秒——只要窗口跨得过最长的那次静默即可，60 秒
+不够。拿 09-04 的真实时间戳重放（5 秒采样），这套配置下灯全程保持蓝，任务结束后
+121 秒转绿；这个结果对采样起点不敏感。没写 `activeMs` 的家族用全局的
+`AGENT_SIGNALS_DISCOVERY_ACTIVE_MS`。
+
+> 定量的「提前 N 秒」不要照抄：20 秒窗口下会不会闪绿、闪几次，取决于采样时刻与写盘
+> 时刻的相位，换一个采样起点结论就会变。**站得住的只有定性结论**——窗口小于最长静默
+> 间隔就可能中途转绿，大于它就不会。
+
+**已知未覆盖**：`modify_backup` 只在 agent 真去改文件时才有写入。**纯聊天、不改文件
+的任务只剩 traces 一条信号，仍可能提前转绿**（09-07 那次会话在 `workspace/sessions/`
+下写了 0 个文件，正是这种情形）。补这个洞需要读 WorkBuddy 自己的登记表，而那张表
+没有 `status` 字段，只能改善身份不能改善状态——尚未决定是否为此破例。头两轮采样只登记现状不出状态（预热），并且**只有真正观察到
+活动之后才可能算忙**——`note_activity` 第一次见到一盏灯时把「安静起点」记成当下，
+那不是活动，拿它当证据会让每盏新灯先蓝一阵再假装完成一次。发现型的灯只会是
+空闲 / 思考中 / 已完成三种，不会有需要输入与疑似卡死。忙不到
+`AGENT_SIGNALS_DISCOVERY_NOTIFY_MIN_BUSY_MS`（60 秒）就完成的，不弹 Mac 通知。
+
+- 卡片上写「自动发现 · ~/.dsh」和一行小字「未登记进程」，说明这盏灯没有任何
+  登记表背书。发现型的灯读不到 token 数据，负载条一律画斜纹 `—`。
+- 点灯打开什么，只由本地画像决定：`tty` 开 Terminal 标签页、`url:<端口>` 开
+  `http://127.0.0.1:<端口>`（且只在端口真的有人听时才可点）、`app:<Name>` 走
+  `open -a`。**端口与 App 名永远不来自请求体**，`open -a` 的名字还要再对一次
+  画像白名单。`.app` 包里的进程没有可切过去的终端标签页，直接标成打不开——
+  打不开的绿灯仍然可以点一下确认掉。
+- 种子画像写在 `discovery.py` 的 `DEFAULT_PROFILES` 里（Claude / Codex / dsh /
+  OpenClaw / Gemini / OpenCode / Aider / Goose / Amp / Qwen / Kimi / Copilot /
+  Cursor Agent / Hermes / Pi / Droid / Crush / WorkBuddy），字典形状与后续要落盘的
+  `runtime-profiles.json` 一致；本阶段只在代码里给种子，不读写文件。
+- `classify()` 除了候选，还顺带交出「考察过但没认出来」的进程列表（pid / exe /
+  简短原因）。这是留给下一阶段探针的出口：主程序叫 `Electron`、dotdir 只出现在
+  `--type=` helper 里的应用永远成不了候选，只扫候选的探针也就永远探不到它。
+- 自动发现源自己不是一个平台（它交出的灯各自带 `platform`），所以平时不占分区；
+  但 `ps` 读不到时它会自己占一块出来写明原因，否则「读不到」会表现成
+  「没有别的 agent 在跑」。
 
 ## 数据源健康度
 
@@ -175,6 +281,12 @@ Codex 数据库会同时从 `~/.codex/` 与 `~/.codex/sqlite/` 探测，并优�
 | `AGENT_SIGNALS_CODEX_PRICES` | 运行目录/`codex_prices.json` | Codex 估算价格文件（可手工编辑） |
 | `AGENT_SIGNALS_CLAUDE_PRICES` | tokenusage 的 `prices.json` | Claude 价格镜像路径 |
 | `AGENT_SIGNALS_HISTORY_BACKFILL_DAYS` | `30` | 历史回填窗口（天） |
+| `AGENT_SIGNALS_DISCOVERY` | `1` | 设为 `0` 关闭自动发现 |
+| `AGENT_SIGNALS_DISCOVERY_ACTIVE_MS` | `20000` | 发现型的灯静默多久算做完 |
+| `AGENT_SIGNALS_DISCOVERY_WARMUP_SAMPLES` | `2` | 头几轮只登记现状、不出状态 |
+| `AGENT_SIGNALS_DISCOVERY_MIN_AGE_S` | `5` | 比这更年轻的进程不出灯 |
+| `AGENT_SIGNALS_DISCOVERY_MAX_AGENTS` | `24` | 发现型灯的数量上限 |
+| `AGENT_SIGNALS_DISCOVERY_NOTIFY_MIN_BUSY_MS` | `60000` | 忙够这么久，完成时才发通知 |
 
 ## 其他
 
@@ -196,6 +308,7 @@ python3 -m unittest discover tests -v
 
 ```
 server.py                 状态采集 + HTTP 服务 + 通知 + 历史埋点/费用估算
+discovery.py              发现引擎（纯函数，不 import server）：种子表 + dotdir 规则
 static/index.html         页面骨架
 static/app.js             渲染、长轮询、提示音、费用与历史面板
 static/styles.css         主题与状态样式
@@ -203,6 +316,7 @@ static/icon-180.png       主屏图标
 static/manifest.webmanifest
 tests/test_server.py      呼吸灯主功能测试
 tests/test_history.py     历史埋点与费用估算测试
+tests/test_discovery.py   发现引擎与发现型灯的测试
 run.command               双击启动
 deploy.sh                 部署到 launchd 运行目录（测试 → 拷贝 → 重启 → 验版本）
 ```

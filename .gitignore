@@ -4,6 +4,13 @@ __pycache__/
 # Runtime state: contains local session ids, never commit
 .agent-signals-state.json
 .agent-signals-state.json.tmp
+# 从仓库目录直接跑（run.command / python3 server.py）时，历史库与价格表会落在
+# 这里。库里有会话 id 与目录名，绝不许提交。
+agent-history.db
+agent-history.db-shm
+agent-history.db-wal
+codex_prices.json
+runtime-profiles.json
 
 # Agent tooling scratch state
 .omc/

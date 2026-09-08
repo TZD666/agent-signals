@@ -836,6 +836,7 @@ PS_SWEEP = (
     "  777   501     0    0:00.10       05:00 claude --bg-spare\n"
     "  888   501   501    1:00.00  2-03:04:05 codex app\n"
     "  902   501   501       0:00          17 /bin/sh\n"
+    "  903   501   501       0:00          ?? /bin/bad-etime\n"
     "垃圾行\n"
 )
 EMPTY_TABLE = {"children": {}, "cpu": {}, "commands": {}, "start_s": {}, "uid": {}}
@@ -851,8 +852,11 @@ class ProcessTableTests(unittest.TestCase):
         self.assertEqual(server.parse_etime("05:00"), 300)
         self.assertEqual(server.parse_etime("01:02:03"), 3723)
         self.assertEqual(server.parse_etime("2-03:04:05"), 183_845)
-        self.assertEqual(server.parse_etime(""), 0)
-        self.assertEqual(server.parse_etime("垃圾"), 0)
+        # 认不出来是「不知道」，不是 0：0 会让 start_s 等于当前时刻，
+        # 一个跑了三天的进程会被当成刚启动。
+        self.assertIsNone(server.parse_etime(""))
+        self.assertIsNone(server.parse_etime("垃圾"))
+        self.assertIsNone(server.parse_etime("x-01:02"))
 
     def test_scan_parses_etime_and_commands(self):
         with patch.object(server, "now_ms", return_value=1_000_000_000_000), patch.object(
@@ -872,6 +876,7 @@ class ProcessTableTests(unittest.TestCase):
                 777: "claude --bg-spare",
                 888: "codex app",
                 902: "/bin/sh",
+                903: "/bin/bad-etime",
             },
         )
         self.assertEqual(
@@ -881,11 +886,15 @@ class ProcessTableTests(unittest.TestCase):
                 777: 999_999_700,
                 888: 999_816_155,
                 902: 999_999_983,
+                # etime 认不出来 → 「不知道多老」，不是「刚启动」。
+                903: None,
             },
         )
-        self.assertEqual(table["uid"], {501: 501, 777: 0, 888: 501, 902: 501})
+        self.assertEqual(
+            table["uid"], {501: 501, 777: 0, 888: 501, 902: 501, 903: 501}
+        )
         # 老字段一个不动：其他代码依赖 children / cpu。
-        self.assertEqual(table["children"], {1: [501], 501: [777, 888, 902]})
+        self.assertEqual(table["children"], {1: [501], 501: [777, 888, 902, 903]})
         self.assertAlmostEqual(table["cpu"][501], 754.56)
         self.assertAlmostEqual(table["cpu"][888], 60.0)
 
@@ -1363,6 +1372,12 @@ class SnapshotPayloadTests(unittest.TestCase):
                 "sources": {
                     "claude": {"state": "live", "detail": ""},
                     "codex": {"state": "live", "detail": "兼容读取"},
+                    # ps 表是空的（这里 patch 成 EMPTY_TABLE），自动发现源据实
+                    # 报「读不到」，不假装「没有别的 agent」。
+                    "discovered": {
+                        "state": "unavailable",
+                        "detail": "ps 没有返回任何进程",
+                    },
                 },
                 "notifications": {"state": "ok", "detail": ""},
                 "platforms": [
@@ -1441,11 +1456,28 @@ class SnapshotPayloadTests(unittest.TestCase):
                             },
                         ],
                     },
+                    {
+                        # 扇出源平时不占分区；读不到数据时必须自己占一块，
+                        # 否则「ps 挂了」会被当成「没有别的 agent 在跑」。
+                        "key": "discovered",
+                        "label": "自动发现",
+                        "order": 89,
+                        "kind": "discovered",
+                        "hint": "从进程里认出来的运行时",
+                        "dismissible": False,
+                        "lockable": False,
+                        "emptyText": "没有发现别的 agent 进程",
+                        "health": {
+                            "state": "unavailable",
+                            "detail": "ps 没有返回任何进程",
+                        },
+                        "agents": [],
+                    },
                 ],
                 "counts": {
                     "agents": 3,
                     "satellites": 3,
-                    "byPlatform": {"claude": 2, "codex": 1},
+                    "byPlatform": {"claude": 2, "codex": 1, "discovered": 0},
                 },
             },
         )
@@ -1498,17 +1530,18 @@ class PlatformAggregationTests(unittest.TestCase):
             {"state": "unavailable", "detail": "数据库不在"},
         )
         gemini = payload["platforms"][2]
+        # 展示元数据来自种子画像登记进 FAMILY_META 的那一份。
         self.assertEqual(
             gemini,
             {
                 "key": "gemini",
-                "label": "Gemini",
-                "order": 90,
+                "label": "Gemini CLI",
+                "order": 12,
                 "kind": "discovered",
-                "hint": "",
+                "hint": "自动发现",
                 "dismissible": False,
                 "lockable": False,
-                "emptyText": "",
+                "emptyText": "没有正在运行的 Gemini CLI",
                 # 非原生平台跟着产出它的那个源的健康度走。
                 "health": {"state": "live", "detail": "本机"},
                 "agents": [make_agent("g-1", "gemini")],
@@ -1807,7 +1840,7 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(body["ok"], True)
         self.assertEqual(body["version"], server.APP_VERSION)
         self.assertEqual(body["schemaVersion"], server.SCHEMA_VERSION)
-        self.assertEqual(body["platforms"], ["claude", "codex"])
+        self.assertEqual(body["platforms"], ["claude", "codex", "discovered"])
         self.assertEqual(body["pid"], os.getpid())
 
 
